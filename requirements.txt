@@ -1,0 +1,4 @@
+aiohttp
+aioredis
+click
+hiredis
