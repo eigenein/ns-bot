@@ -58,6 +58,32 @@ def run_bot(telegram_token: str, botan_token: str):
             bot.stop()
 
 
+# Emoji.
+# ----------------------------------------------------------------------------------------------------------------------
+
+class Emoji:
+    BLACK_SUN_WITH_RAYS = chr(0x2600)
+    PENSIVE_FACE = chr(0x1F614)
+
+
+# Bot response phrases.
+# ----------------------------------------------------------------------------------------------------------------------
+
+class Responses:
+    START = (
+        "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
+        "To get started please send me some URLs of RSS feeds you’d like to read."
+        " You can split them by whitespaces."
+    ).format(emoji=Emoji)
+
+    INVALID_URL = "This doesn’t look like a valid URL:\n\n{url}"
+
+    ERROR = (
+        "I’m experiencing some problems, sorry. {emoji.PENSIVE_FACE}\n"
+        "Please try again."
+    ).format(emoji=Emoji)
+
+
 # Bot implementation.
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -113,13 +139,34 @@ class Bot:
         Handle single message from a user.
         """
         if text == "/start":
-            await self._telegram.send_message(sender["id"], Responses.START.format(sender=sender), parse_mode=ParseMode.markdown)
-            await self._botan.track(sender["id"], "Start")
-            return
+            await self._handle_start(sender)
+        else:
+            # Try to parse the message as a list of feed URLs.
+            await self._handle_urls(sender, text)
 
-        await self._botan.track(sender["id"], "Unrecognized")
-        await self._telegram.send_message(sender["id"], Responses.UNRECOGNIZED)
+    async def _handle_start(self, sender: dict):
+        """
+        Handles /start command.
+        """
+        await self._telegram.send_message(sender["id"], Responses.START.format(sender=sender), parse_mode=ParseMode.markdown)
+        await self._botan.track(sender["id"], "Start")
 
+    async def _handle_urls(self, sender: dict, text: str):
+        """
+        Handles list of feed URLs.
+        """
+        urls = text.split()
+        for url in urls:
+            if not url.startswith("http://") and not url.startswith("https://"):
+                await self._telegram.send_message(sender["id"], Responses.INVALID_URL.format(url=url))
+                await self._botan.track(sender["id"], "Invalid URL", url=url)
+                return
+
+        # TODO
+
+
+# Telegram API.
+# ----------------------------------------------------------------------------------------------------------------------
 
 class ParseMode(enum.Enum):
     """
@@ -215,31 +262,6 @@ class Botan:
 
     def close(self):
         self._session.close()
-
-
-# Emoji.
-# ----------------------------------------------------------------------------------------------------------------------
-
-class Emoji:
-    BLACK_SUN_WITH_RAYS = chr(0x2600)
-    PENSIVE_FACE = chr(0x1F614)
-
-
-# Bot response phrases.
-# ----------------------------------------------------------------------------------------------------------------------
-
-class Responses:
-    START = (
-        "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
-        "To get started please send me some URLs of RSS feeds you’d like to read."
-    ).format(emoji=Emoji)
-
-    ERROR = (
-        "I’m experiencing some problems, sorry. {emoji.PENSIVE_FACE}\n"
-        "Please try again."
-    ).format(emoji=Emoji)
-
-    UNRECOGNIZED = "Sorry I’m not sure that I understand what do you mean."
 
 
 # Entry point.
