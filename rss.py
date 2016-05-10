@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+# Yes, I’m aware that splitting into smaller modules is good.
+# I didn’t do that intentionally this time.
+# Sorry.
+
 """
 What can this bot do?
 
@@ -13,18 +17,11 @@ import enum
 import json
 import logging
 import typing
+import uuid
 
 import aiohttp
 import aioredis
 import click
-
-
-# Configuration.
-# ----------------------------------------------------------------------------------------------------------------------
-
-REDIS_ADDRESS = ("localhost", 6379)
-TELEGRAM_LIMIT = 10
-TELEGRAM_TIMEOUT = 10
 
 
 # CLI Commands.
@@ -56,6 +53,7 @@ def run_bot(telegram_token: str, botan_token: str):
             asyncio.get_event_loop().run_forever()
         finally:
             bot.stop()
+            # TODO: graceful stop.
 
 
 # Emoji.
@@ -72,53 +70,94 @@ class Emoji:
 class Responses:
     START = (
         "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
-        "To get started please send me some URLs of RSS feeds you’d like to read."
-        " You can split them by whitespaces."
+        "\n"
+        "To get started please send me some URLs of either RSS or Atom feeds you’d like to read."
     ).format(emoji=Emoji)
 
-    INVALID_URL = "This doesn’t look like a valid URL:\n\n{url}"
+    SUBSCRIBED = (
+        "Ok, the following URLs were found and added to the queue:\n"
+        "\n"
+        "{urls}\n"
+        "\n"
+        "Hang on while we’re reading them. This can take several minutes."
+    )
 
     ERROR = (
         "I’m experiencing some problems, sorry. {emoji.PENSIVE_FACE}\n"
-        "Please try again."
+        "\n"
+        "Please try again later."
     ).format(emoji=Emoji)
+
+
+# Redis wrapper.
+# ----------------------------------------------------------------------------------------------------------------------
+
+# noinspection PyUnresolvedReferences
+class Database:
+    @staticmethod
+    async def create():
+        return Database(await aioredis.create_redis(("localhost", 6379)))
+
+    def __init__(self, connection: aioredis.RedisConnection):
+        self._connection = connection
+
+    async def upsert_feed(self, feed_id, url):
+        logging.debug("Add feed %s: %s", feed_id, url)
+        await self._connection.setnx("rss:%s:url" % feed_id, url)
+
+    async def subscribe(self, user_id: int, feed_id: str):
+        logging.debug("Subscribe user #%s to feed %s.", user_id, feed_id)
+        await self._connection.sadd("rss:%s:subscriptions" % user_id, feed_id)
+
+    def close(self):
+        self._connection.close()
 
 
 # Bot implementation.
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Bot:
+    _LIMIT = 10
+    _TIMEOUT = 10
 
-    _is_stopped = False
+    _KEYBOARD_DEFAULT = json.dumps({
+        "inline_keyboard": [[
+            {"text": "Read", "callback_data": "/read"},
+            {"text": "Unsubscribe", "callback_data": "/unsubscribe"},
+        ]],
+    })
 
     def __init__(self, telegram_token: str, botan_token: str):
         self._telegram = Telegram(telegram_token)
         self._botan = Botan(botan_token)
-        self._db = None
+        self._session = aiohttp.ClientSession()
+        self._db = None  # type: Database
         self._offset = 0
+        self._is_stopped = False
 
     async def run(self):
-        self._db = await aioredis.create_redis(REDIS_ADDRESS)
+        self._db = await Database.create()
         while not self._is_stopped:
             try:
                 await self._loop()
             except Exception as ex:
                 logging.error("Unhandled error.", exc_info=ex)
-                # await self._botan.track(None, "Error", message=str(ex))
+                await self._botan.track(None, "Error", message=str(ex))
 
     def stop(self):
         self._is_stopped = True
 
     def close(self):
-        self._telegram.close()
-        self._botan.close()
         self._db.close()
+        self._session.close()
+        self._botan.close()
+        self._telegram.close()
 
     async def _loop(self):
         """
         Executes one message loop iteration. Gets Telegram updates and handles them.
         """
-        updates = await self._telegram.get_updates(self._offset, TELEGRAM_LIMIT, TELEGRAM_TIMEOUT)
+        updates = await self._telegram.get_updates(self._offset, self._LIMIT, self._TIMEOUT)
         for update in updates:
             logging.info("Got update #%s.", update["update_id"])
             self._offset = update["update_id"] + 1
@@ -138,31 +177,42 @@ class Bot:
         """
         Handle single message from a user.
         """
-        if text == "/start":
-            await self._handle_start(sender)
+        if text.startswith("/"):
+            command, *arguments = text.split()
+            if command == "/start":
+                await self._handle_start(sender)
+                await self._botan.track(sender["id"], "Start")
         else:
-            # Try to parse the message as a list of feed URLs.
-            await self._handle_urls(sender, text)
+            await self._handle_subscribe(sender, text)
+            await self._botan.track(sender["id"], "Subscribe")
 
     async def _handle_start(self, sender: dict):
         """
         Handles /start command.
         """
         await self._telegram.send_message(sender["id"], Responses.START.format(sender=sender), parse_mode=ParseMode.markdown)
-        await self._botan.track(sender["id"], "Start")
 
-    async def _handle_urls(self, sender: dict, text: str):
+    async def _handle_subscribe(self, sender: dict, text: str):
         """
-        Handles list of feed URLs.
+        Handles subscribing to the feeds.
         """
-        urls = text.split()
-        for url in urls:
+        # TODO: limit count and length of URLs per user.
+        added_urls = []
+        for url in set(text.split()):
             if not url.startswith("http://") and not url.startswith("https://"):
-                await self._telegram.send_message(sender["id"], Responses.INVALID_URL.format(url=url))
-                await self._botan.track(sender["id"], "Invalid URL", url=url)
-                return
-
-        # TODO
+                continue
+            feed_id = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
+            await asyncio.gather(
+                self._db.upsert_feed(feed_id, url),
+                self._db.subscribe(sender["id"], feed_id),
+            )
+            added_urls.append(url)
+        await self._telegram.send_message(
+            sender["id"],
+            Responses.SUBSCRIBED.format(urls="\n".join(added_urls)),
+            reply_markup=self._KEYBOARD_DEFAULT,
+            disable_web_page_preview=True,
+        )
 
 
 # Telegram API.
@@ -175,6 +225,20 @@ class ParseMode(enum.Enum):
     default = None
     markdown = "Markdown"
     html = "HTML"
+
+
+class ChatAction(enum.Enum):
+    """
+    https://core.telegram.org/bots/api#sendchataction
+    """
+    typing = "typing"
+    upload_photo = "upload_photo"
+    record_video = "record_video"
+    upload_video = "upload_video"
+    record_audio = "record_audio"
+    upload_audio = "upload_audio"
+    upload_document = "upload_document"
+    find_location = "find_location"
 
 
 class Telegram:
@@ -207,6 +271,12 @@ class Telegram:
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         return await self.post("sendMessage", **params)
+
+    async def send_chat_action(self, chat_id: typing.Union[int, str], action: ChatAction):
+        """
+        https://core.telegram.org/bots/api#sendchataction
+        """
+        return await self.post("sendChatAction", chat_id=chat_id, action=action.value)
 
     async def post(self, method: str, **kwargs):
         logging.debug("%s(%s)", method, kwargs)
