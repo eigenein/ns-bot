@@ -92,13 +92,12 @@ class Responses:
 # Redis wrapper.
 # ----------------------------------------------------------------------------------------------------------------------
 
-# noinspection PyUnresolvedReferences
 class Database:
     @staticmethod
     async def create():
         return Database(await aioredis.create_redis(("localhost", 6379)))
 
-    def __init__(self, connection: aioredis.RedisConnection):
+    def __init__(self, connection: aioredis.Redis):
         self._connection = connection
 
     async def upsert_feed(self, feed_id, url):
