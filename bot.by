@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-# Yes, I’m aware that splitting into smaller modules is good.
-# I didn’t do that intentionally this time.
-# Sorry.
-
 """
 What can this bot do?
 
-This bot is an RSS reader that allows you to read the most interesting articles from your feeds first.
+The bot can plan a trip with NS trains via their recommendations service.
 """
 
 import asyncio
@@ -17,7 +13,6 @@ import enum
 import json
 import logging
 import typing
-import uuid
 
 import aiohttp
 import aioredis
@@ -27,10 +22,11 @@ import click
 # CLI Commands.
 # ----------------------------------------------------------------------------------------------------------------------
 
-@click.group()
+@click.command()
+@click.option("-c", "--config", "config_file", type=click.File("rt", encoding="utf-8"), help="Configuration file.", required=True)
 @click.option("-l", "--log-file", type=click.File("at", encoding="utf-8"))
 @click.option("-v", "--verbose", type=bool, is_flag=True)
-def main(log_file: click.File, verbose: bool):
+def main(config_file: click.File, log_file: click.File, verbose: bool):
     logging.basicConfig(
         datefmt="%Y-%m-%d %H:%M:%S",
         format="%(asctime)s (%(module)s) [%(levelname)s] %(message)s",
@@ -38,22 +34,20 @@ def main(log_file: click.File, verbose: bool):
         stream=(log_file or click.get_text_stream("stderr")),
     )
 
+    logging.info("Reading configuration…")
+    config = json.load(config_file)
 
-@main.command(name="bot")
-@click.option("-t", "--telegram-token", help="Telegram bot token.", required=True, type=str)
-@click.option("-b", "--botan-token", help="Botan.io token.", required=True, type=str)
-def run_bot(telegram_token: str, botan_token: str):
-    """
-    Run Telegram bot.
-    """
-    logging.info("Starting bot.")
-    with contextlib.closing(Bot(telegram_token, botan_token)) as bot:
-        try:
-            asyncio.ensure_future(bot.run())
-            asyncio.get_event_loop().run_forever()
-        finally:
-            bot.stop()
-            # TODO: graceful stop.
+    logging.info("Starting bot…")
+    with contextlib.closing(Telegram(config["telegram_token"])) as telegram:
+        with contextlib.closing(Botan(config["botan_token"])) as botan:
+            with contextlib.closing(Ns(config["ns_api"]["login"], config["ns_api"]["password"])) as ns:
+                with contextlib.closing(Bot(telegram, botan, ns)) as bot:
+                    try:
+                        asyncio.ensure_future(bot.run())
+                        asyncio.get_event_loop().run_forever()
+                    finally:
+                        bot.stop()
+                        # TODO: graceful stop.
 
 
 # Emoji.
@@ -71,21 +65,13 @@ class Responses:
     START = (
         "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
         "\n"
-        "To get started please send me some URLs of either RSS or Atom feeds you’d like to read."
+        "To get started please send me your favorite stations, one per line. Don’t worry, you can change them later."
     ).format(emoji=Emoji)
 
-    SUBSCRIBED = (
-        "Ok, the following URLs were found and added to the queue:\n"
-        "\n"
-        "{urls}\n"
-        "\n"
-        "Hang on while we’re reading them. This can take several minutes."
-    )
-
     ERROR = (
-        "I’m experiencing some problems, sorry. {emoji.PENSIVE_FACE}\n"
+        "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}\n"
         "\n"
-        "Please try again later."
+        "Maybe try again later."
     ).format(emoji=Emoji)
 
 
@@ -98,120 +84,10 @@ class Database:
         return Database(await aioredis.create_redis(("localhost", 6379)))
 
     def __init__(self, connection: aioredis.Redis):
-        self._connection = connection
-
-    async def upsert_feed(self, feed_id, url):
-        logging.debug("Add feed %s: %s", feed_id, url)
-        await self._connection.setnx("rss:%s:url" % feed_id, url)
-
-    async def subscribe(self, user_id: int, feed_id: str):
-        logging.debug("Subscribe user #%s to feed %s.", user_id, feed_id)
-        await self._connection.sadd("rss:%s:subscriptions" % user_id, feed_id)
+        self.connection = connection
 
     def close(self):
-        self._connection.close()
-
-
-# Bot implementation.
-# ----------------------------------------------------------------------------------------------------------------------
-
-class Bot:
-    _LIMIT = 10
-    _TIMEOUT = 10
-
-    _KEYBOARD_DEFAULT = json.dumps({
-        "inline_keyboard": [[
-            {"text": "Read", "callback_data": "/read"},
-            {"text": "Unsubscribe", "callback_data": "/unsubscribe"},
-        ]],
-    })
-
-    def __init__(self, telegram_token: str, botan_token: str):
-        self._telegram = Telegram(telegram_token)
-        self._botan = Botan(botan_token)
-        self._session = aiohttp.ClientSession()
-        self._db = None  # type: Database
-        self._offset = 0
-        self._is_stopped = False
-
-    async def run(self):
-        self._db = await Database.create()
-        while not self._is_stopped:
-            try:
-                await self._loop()
-            except Exception as ex:
-                logging.error("Unhandled error.", exc_info=ex)
-                await self._botan.track(None, "Error", message=str(ex))
-
-    def stop(self):
-        self._is_stopped = True
-
-    def close(self):
-        self._db.close()
-        self._session.close()
-        self._botan.close()
-        self._telegram.close()
-
-    async def _loop(self):
-        """
-        Executes one message loop iteration. Gets Telegram updates and handles them.
-        """
-        updates = await self._telegram.get_updates(self._offset, self._LIMIT, self._TIMEOUT)
-        for update in updates:
-            logging.info("Got update #%s.", update["update_id"])
-            self._offset = update["update_id"] + 1
-            if "message" in update:
-                sender, text = update["message"]["from"], update["message"]["text"]
-            elif "callback_query" in update:
-                sender, text = update["callback_query"]["from"], update["callback_query"]["data"]
-            else:
-                continue
-            try:
-                await self._handle_message(sender, text)
-            except Exception:
-                await self._telegram.send_message(sender["id"], Responses.ERROR)
-                raise
-
-    async def _handle_message(self, sender: dict, text: str):
-        """
-        Handle single message from a user.
-        """
-        if text.startswith("/"):
-            command, *arguments = text.split()
-            if command == "/start":
-                await self._handle_start(sender)
-                await self._botan.track(sender["id"], "Start")
-        else:
-            await self._handle_subscribe(sender, text)
-            await self._botan.track(sender["id"], "Subscribe")
-
-    async def _handle_start(self, sender: dict):
-        """
-        Handles /start command.
-        """
-        await self._telegram.send_message(sender["id"], Responses.START.format(sender=sender), parse_mode=ParseMode.markdown)
-
-    async def _handle_subscribe(self, sender: dict, text: str):
-        """
-        Handles subscribing to the feeds.
-        """
-        # TODO: limit count and length of URLs per user.
-        added_urls = []
-        for url in set(text.split()):
-            if not url.startswith("http://") and not url.startswith("https://"):
-                continue
-            feed_id = uuid.uuid5(uuid.NAMESPACE_URL, url).hex
-            await asyncio.gather(
-                self._db.upsert_feed(feed_id, url),
-                self._db.subscribe(sender["id"], feed_id),
-            )
-            added_urls.append(url)
-        await self._telegram.send_message(
-            sender["id"],
-            Responses.SUBSCRIBED.format(urls="\n".join(added_urls)),
-            reply_markup=self._KEYBOARD_DEFAULT,
-            disable_web_page_preview=True,
-        )
+        self.connection.close()
 
 
 # Telegram API.
@@ -242,11 +118,11 @@ class ChatAction(enum.Enum):
 
 class Telegram:
 
-    _HEADERS = {"Content-Type": "application/json"}
+    HEADERS = {"Content-Type": "application/json"}
 
     def __init__(self, token: str):
         self._url = "https://api.telegram.org/bot{}/{{}}".format(token)
-        self._session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession()
 
     async def get_updates(self, offset: int, limit: int, timeout: int):
         return await self.post("getUpdates", offset=offset, limit=limit, timeout=timeout)
@@ -279,7 +155,7 @@ class Telegram:
 
     async def post(self, method: str, **kwargs):
         logging.debug("%s(%s)", method, kwargs)
-        async with self._session.post(self._url.format(method), data=json.dumps(kwargs), headers=self._HEADERS) as response:
+        async with self.session.post(self._url.format(method), data=json.dumps(kwargs), headers=self.HEADERS) as response:
             payload = await response.json()
             if payload["ok"]:
                 logging.debug("%s → %s", method, payload)
@@ -289,7 +165,7 @@ class Telegram:
                 raise TelegramException(payload["description"])
 
     def close(self):
-        self._session.close()
+        self.session.close()
 
 
 class TelegramException(Exception):
@@ -306,22 +182,22 @@ class Botan:
     Botan.io API.
     """
 
-    _HEADERS = {"Content-Type": "application/json"}
+    HEADERS = {"Content-Type": "application/json"}
 
     def __init__(self, token: str):
-        self._token = token
-        self._session = aiohttp.ClientSession()
+        self.token = token
+        self.session = aiohttp.ClientSession()
 
     async def track(self, uid: typing.Optional[str], name: str, **kwargs):
         """
         Tracks event.
         """
         try:
-            async with self._session.post(
+            async with self.session.post(
                 "https://api.botan.io/track",
-                params={"token": self._token, "uid": uid, "name": name},
+                params={"token": self.token, "uid": uid, "name": name},
                 data=json.dumps(kwargs),
-                headers=self._HEADERS,
+                headers=self.HEADERS,
             ) as response:
                 payload = await response.json()
                 if payload["status"] == "failed":
@@ -330,7 +206,120 @@ class Botan:
             logging.error("Failed to track event.", exc_info=ex)
 
     def close(self):
-        self._session.close()
+        self.session.close()
+
+
+# NS API.
+# ----------------------------------------------------------------------------------------------------------------------
+
+class Ns:
+    def __init__(self, login: str, password: str):
+        self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
+
+    async def get_stations(self):
+        """
+        Gets station list.
+        """
+        async with self.session.get("http://webservices.ns.nl/ns-api-stations-v2") as response:
+            pass
+
+    def close(self):
+        self.session.close()
+
+
+# Bot implementation.
+# ----------------------------------------------------------------------------------------------------------------------
+
+class Bot:
+    LIMIT = 10
+    TIMEOUT = 10
+
+    def __init__(self, telegram: Telegram, botan: Botan, ns: Ns):
+        self.telegram = telegram
+        self.botan = botan
+        self.ns = ns
+        self.db = None  # type: Database
+        self.offset = 0
+        self.is_stopped = False
+
+    async def run(self):
+        self.db = await Database.create()
+
+        logging.info("Pre-populating station list…")
+        await self.ns.get_stations()
+
+        logging.info("Running.")
+        while not self.is_stopped:
+            try:
+                await self.run_loop()
+            except Exception as ex:
+                logging.error("Unhandled error.", exc_info=ex)
+                await self.botan.track(None, "Error", message=str(ex))
+
+    def stop(self):
+        self.is_stopped = True
+
+    def close(self):
+        self.db.close()
+
+    async def run_loop(self):
+        """
+        Executes one message loop iteration. Gets Telegram updates and handles them.
+        """
+        updates = await self.telegram.get_updates(self.offset, self.LIMIT, self.TIMEOUT)
+        for update in updates:
+            logging.info("Got update #%s.", update["update_id"])
+            self.offset = update["update_id"] + 1
+            # Merge message text and callback query data.
+            if "message" in update:
+                sender, text = update["message"]["from"], update["message"]["text"]
+            elif "callback_query" in update:
+                sender, text = update["callback_query"]["from"], update["callback_query"]["data"]
+            else:
+                continue
+            try:
+                await self.handle_message(sender, text)
+            except Exception:
+                await self.telegram.send_message(sender["id"], Responses.ERROR)
+                raise
+
+    async def handle_message(self, sender: dict, text: str):
+        """
+        Handle single message from a user.
+        """
+        if text.startswith("/"):
+            command, *arguments = text.split()
+            if command == "/start":
+                await self.handle_start(sender)
+                await self.botan.track(sender["id"], "Start")
+            elif command == "/cancel":
+                await self.handle_cancel(sender)
+                await self.botan.track(sender["id"], "Cancel")
+        else:
+            await self.handle_search(sender, text)
+            await self.botan.track(sender["id"], "Search")
+
+    async def handle_start(self, sender: dict):
+        """
+        Handles /start command.
+        """
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.START.format(sender=sender),
+            parse_mode=ParseMode.markdown,
+        )
+
+    async def handle_cancel(self, sender: dict):
+        """
+        Handles /cancel command.
+        """
+        pass  # TODO
+
+    async def handle_search(self, sender: dict, text: str):
+        """
+        Handles stations search.
+        """
+        pass  # TODO
 
 
 # Entry point.
