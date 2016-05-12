@@ -8,11 +8,15 @@ The bot can plan a trip with NS trains via their recommendations service.
 """
 
 import asyncio
+import collections
 import contextlib
+import difflib
 import enum
 import json
 import logging
 import typing
+
+from xml.etree import ElementTree
 
 import aiohttp
 import aioredis
@@ -65,8 +69,15 @@ class Responses:
     START = (
         "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
         "\n"
-        "To get started please send me your favorite stations, one per line. Don’t worry, you can change them later."
+        "You can add your favorite station simply by sending me its name."
+        " Also you can take a look at departures from the nearest station."
     ).format(emoji=Emoji)
+
+    DEFAULT = "Ok, where would you like to go?"
+
+    NO_SEARCH_RESULTS = "I couldn’t find any station with this name. Please check it and try again."
+
+    SEARCH_RESULTS = "Please confirm the station and I’ll add it to your favorites."
 
     ERROR = (
         "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}\n"
@@ -213,6 +224,8 @@ class Botan:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Ns:
+    Station = collections.namedtuple("Station", "code long_name names lat lon")
+
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
 
@@ -220,11 +233,46 @@ class Ns:
         """
         Gets station list.
         """
+        stations = []
         async with self.session.get("http://webservices.ns.nl/ns-api-stations-v2") as response:
-            pass
+            stations_element = ElementTree.fromstring(await response.text())
+            for station_element in stations_element:
+                names = {element.text for element in station_element.find("Namen")}
+                names.update(element.text for element in station_element.find("Synoniemen"))
+                stations.append(Ns.Station(
+                    code=station_element.find("Code").text,
+                    long_name=station_element.find("Namen").find("Lang").text,
+                    names=names,
+                    lat=station_element.find("Lat").text,
+                    lon=station_element.find("Lon").text,
+                ))
+        return stations
 
     def close(self):
         self.session.close()
+
+
+# Station index.
+# ----------------------------------------------------------------------------------------------------------------------
+
+class StationIndex:
+    def __init__(self, stations: typing.Iterable[Ns.Station]):
+        self.code_station = {station.code: station for station in stations}
+        self.name_station = {name.lower(): station for station in stations for name in station.names}
+        self.names = list(self.name_station)
+
+    def search(self, query: str) -> typing.List[Ns.Station]:
+        """
+        Searches for unique stations that match the query.
+        """
+        return [
+            self.code_station[code]
+            for code in {
+                self.name_station[name].code
+                # TODO: preserve order.
+                for name in difflib.get_close_matches(query.lower(), self.names)
+            }
+        ]
 
 
 # Bot implementation.
@@ -234,11 +282,15 @@ class Bot:
     LIMIT = 10
     TIMEOUT = 10
 
+    KEY_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
+    KEY_DEPARTURES = {"text": "Departures", "callback_data": "/departures"}
+
     def __init__(self, telegram: Telegram, botan: Botan, ns: Ns):
         self.telegram = telegram
         self.botan = botan
         self.ns = ns
         self.db = None  # type: Database
+        self.stations = None
         self.offset = 0
         self.is_stopped = False
 
@@ -246,7 +298,9 @@ class Bot:
         self.db = await Database.create()
 
         logging.info("Pre-populating station list…")
-        await self.ns.get_stations()
+        stations = await self.ns.get_stations()
+        logging.info("Retrieved %d stations.", len(stations))
+        self.stations = StationIndex(stations)
 
         logging.info("Running.")
         while not self.is_stopped:
@@ -283,6 +337,11 @@ class Bot:
                 await self.telegram.send_message(sender["id"], Responses.ERROR)
                 raise
 
+    async def get_default_keyboard(self, user_id: int) -> str:
+        # TODO: return station buttons.
+        # TODO: return manage/delete button if there is any station.
+        return json.dumps({"inline_keyboard": [[self.KEY_DEPARTURES]]})
+
     async def handle_message(self, sender: dict, text: str):
         """
         Handle single message from a user.
@@ -307,19 +366,37 @@ class Bot:
             sender["id"],
             Responses.START.format(sender=sender),
             parse_mode=ParseMode.markdown,
+            reply_markup=self.get_default_keyboard(sender["id"]),
         )
 
     async def handle_cancel(self, sender: dict):
         """
         Handles /cancel command.
         """
-        pass  # TODO
+        await self.telegram.send_message(sender["id"], Responses.DEFAULT, reply_markup=self.get_default_keyboard(sender["id"]))
 
     async def handle_search(self, sender: dict, text: str):
         """
-        Handles stations search.
+        Handles station search.
         """
-        pass  # TODO
+        stations = self.stations.search(text.strip())
+        if stations:
+            buttons = [
+                [{"text": station.long_name, "callback_data": "/add %s" % station.code}]
+                for station in stations
+            ]
+            buttons.append([self.KEY_CANCEL])
+            await self.telegram.send_message(
+                sender["id"],
+                Responses.SEARCH_RESULTS,
+                reply_markup=json.dumps({"inline_keyboard": buttons}),
+            )
+        else:
+            await self.telegram.send_message(
+                sender["id"],
+                Responses.NO_SEARCH_RESULTS,
+                reply_markup=self.get_default_keyboard(sender["id"]),
+            )
 
 
 # Entry point.
