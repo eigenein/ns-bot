@@ -4,7 +4,7 @@
 """
 What can this bot do?
 
-The bot can plan a trip with NS trains via their recommendations service.
+The bot can plan a journey with NS trains via their recommendations service.
 """
 
 import asyncio
@@ -66,6 +66,7 @@ class Emoji:
     PENSIVE_FACE = chr(0x1F614)
     STATION = chr(0x1F689)
     TRAIN = chr(0x1F686)
+    TWISTED_RIGHTWARDS_ARROWS = chr(0x1F500)
     WARNING_SIGN = chr(0x26A0)
     WHITE_QUESTION_MARK_ORNAMENT = chr(0x2754)
 
@@ -94,7 +95,21 @@ class Responses:
         "{emoji.TRAIN} {{departure.train_type}} _{{departure.route_text}}_",
     )).format(emoji=Emoji)
 
-    DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a trip."
+    # Stop = collections.namedtuple("Stop", ["name", "time", "platform", "is_platform_changed", "delay_text"])
+
+    JOURNEY = "\n".join((
+        "{emoji.ALARM_CLOCK} *{{journey.actual_departure_time:%-H:%M}}* → _{{duration}}_ → *{{journey.actual_arrival_time:%-H:%M}}*",
+        "{{components_text}}",
+    )).format(emoji=Emoji)
+
+    COMPONENT = "\n".join((
+        "{emoji.TRAIN} _{{component.transport_type}}_",
+        "*{{first_stop.name}}* → *{{last_stop.name}}*",
+        "{emoji.ALARM_CLOCK} *{{first_stop.time:%-H:%M}}* {emoji.STATION} *{{first_stop.platform}}*{{first_stop_warning}} →"
+        " {emoji.ALARM_CLOCK} *{{last_stop.time:%-H:%M}}* {emoji.STATION} *{{last_stop.platform}}*{{last_stop_warning}}",
+    )).format(emoji=Emoji)
+
+    DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a journey."
     ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
     DELETED = "It’s deleted. You can always add it back later."
     SEARCH = "Just send me a station name. You can do that whenever you want."
@@ -104,8 +119,8 @@ class Responses:
     LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
     DEPARTURES = "Departures from *{station_name}*:\n\n{departures_text}"
     NO_DEPARTURES = "No departures found from *{station_name}*."
-    TRIPS = "Trips from *{departure_name}* to *{destination_name}*:\n\n{trips_text}"
-    NO_TRIPS = "No trips found from *{departure_name}* to *{destination_name}*."
+    JOURNEYS = "Journeys from *{departure_name}* to *{destination_name}*:\n\n{journeys_text}"
+    NO_JOURNEYS = "No journeys found from *{departure_name}* to *{destination_name}*."
 
 
 # Redis wrapper.
@@ -140,6 +155,13 @@ class Database:
 
     async def set_departures(self, station_code: str, departures):
         await self.connection.setex("ns:%s:departures" % station_code, 60, pickle.dumps(departures))
+
+    async def get_journeys(self, departure_code: str, destination_code: str) -> typing.List["Journey"]:
+        serialized_journeys = await self.connection.get("ns:%s:%s:journeys" % (departure_code, destination_code))
+        return pickle.loads(serialized_journeys) if serialized_journeys else None
+
+    async def set_journeys(self, departure_code: str, destination_code: str, journeys):
+        await self.connection.setex("ns:%s:%s:journeys" % (departure_code, destination_code), 60, pickle.dumps(journeys))
 
     def close(self):
         self.connection.close()
@@ -311,7 +333,7 @@ Departure = collections.namedtuple("Departure", [
     "platform",
     "is_platform_changed",
 ])
-Trip = collections.namedtuple("Trip", [
+Journey = collections.namedtuple("Journey", [
     "transfer_count",
     "planned_duration",
     "actual_duration",
@@ -320,7 +342,7 @@ Trip = collections.namedtuple("Trip", [
     "actual_arrival_time",
     "components",
 ])
-TripComponent = collections.namedtuple("TripComponent", ["transport_type", "stops"])
+JourneyComponent = collections.namedtuple("JourneyComponent", ["transport_type", "stops"])
 Stop = collections.namedtuple("Stop", ["name", "time", "platform", "is_platform_changed", "delay_text"])
 
 
@@ -368,7 +390,7 @@ class Ns:
             for element in root
         ]
 
-    async def plan_trip(self, departure_code: str, destination_code: str) -> typing.List[Trip]:
+    async def plan_journey(self, departure_code: str, destination_code: str) -> typing.List[Journey]:
         """
         http://www.ns.nl/en/travel-information/ns-api/documentation-travel-recommendations.html
         """
@@ -378,7 +400,7 @@ class Ns:
         ) as response:
             root = ElementTree.fromstring(await response.text())
         return [
-            Trip(
+            Journey(
                 transfer_count=int(element.find("AantalOverstappen").text),
                 planned_duration=element.find("GeplandeReisTijd").text,
                 actual_duration=self.element_text(element.find("ActueleReisTijd")),
@@ -386,7 +408,7 @@ class Ns:
                 actual_departure_time=datetime.datetime.strptime(element.find("ActueleVertrekTijd").text, self.TIME_FORMAT),
                 actual_arrival_time=datetime.datetime.strptime(element.find("ActueleAankomstTijd").text, self.TIME_FORMAT),
                 components=[
-                    TripComponent(
+                    JourneyComponent(
                         transport_type=component.find("VervoerType").text,
                         stops=[
                             Stop(
@@ -454,8 +476,9 @@ class Bot:
     BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
     BUTTON_SEARCH = {"text": "Search Station", "callback_data": "/search"}
     BUTTON_FEEDBACK = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
+    BUTTON_BACK = {"text": "Back", "callback_data": "/cancel"}
 
-    KEYBOARD_BACK = json.dumps({"inline_keyboard": [[{"text": "Back", "callback_data": "/cancel"}]]})
+    KEYBOARD_BACK = json.dumps({"inline_keyboard": [[BUTTON_BACK]]})
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -656,23 +679,48 @@ class Bot:
         """
         Handles /go command with two arguments provided.
         """
-        trips = await self.ns.plan_trip(departure_code, destination_code)
-        logging.debug("%d trips found.", len(trips))
+        journeys = await self.db.get_journeys(departure_code, destination_code)
+        if journeys is None:
+            logging.debug("Journeys from %s to %s are not cached.", departure_code, destination_code)
+            journeys = await self.ns.plan_journey(departure_code, destination_code)
+            await self.db.set_journeys(departure_code, destination_code, journeys)
+        journeys = journeys[:5]
 
         departure_name = self.stations.code_station[departure_code].long_name
         destination_name = self.stations.code_station[destination_code].long_name
-        trips_text = ""
-        text = (
-            Responses.TRIPS.format(departure_name=departure_name, destination_name=destination_name, trips_text=trips_text)
-            if trips else Responses.NO_TRIPS.format(departure_name=departure_name, destination_name=destination_name)
+
+        journeys_text = "\n\n".join(
+            Responses.JOURNEY.format(
+                journey=journey,
+                duration=(journey.actual_duration or journey.planned_duration),
+                components_text="\n".join(
+                    Responses.COMPONENT.format(
+                        component=component,
+                        first_stop=component.stops[0],
+                        first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else " "),
+                        last_stop=component.stops[-1],
+                        last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else " "),
+                    )
+                    for component in journey.components
+                ),
+            ) for journey in journeys
         )
+        if journeys_text:
+            text = Responses.JOURNEYS.format(departure_name=departure_name, destination_name=destination_name, journeys_text=journeys_text)
+        else:
+            text = Responses.NO_JOURNEYS.format(departure_name=departure_name, destination_name=destination_name)
 
         await asyncio.gather(
             self.telegram.send_message(
                 user_id,
                 text,
                 parse_mode=ParseMode.markdown,
-                reply_markup=self.KEYBOARD_BACK,
+                reply_markup=json.dumps({
+                    "inline_keyboard": [
+                        [{"text": "Refresh", "callback_data": "/go %s %s" % (departure_code, destination_code)}],
+                        [self.BUTTON_BACK],
+                    ],
+                }),
             ),
             self.botan.track(user_id, "Plan", departure_code=departure_code, destination_code=destination_code),
         )
