@@ -73,7 +73,7 @@ class Responses:
         "\n"
         "You can add your favorite station simply by sending me its name. Small typos are okay.\n"
         "\n"
-        "Also you can quickly take a look at departures from the nearest station."
+        "You can also send me your location to see departures from the nearest station."
     ).format(emoji=Emoji)
 
     ERROR = (
@@ -82,10 +82,12 @@ class Responses:
         "Maybe try again later."
     ).format(emoji=Emoji)
 
-    DEFAULT = "Ok, where would you like to go?"
+    DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a trip."
+    ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
     SEARCH = "Just send me a station name. You can do that whenever you want."
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
+    SELECT_DESTINATION = "Ok, where would you like to go?"
 
 
 # Redis wrapper.
@@ -98,6 +100,15 @@ class Database:
 
     def __init__(self, connection: aioredis.Redis):
         self.connection = connection
+
+    async def add_favorite_station(self, user_id: int, station_code: str):
+        await self.connection.sadd("ns:%s:favorites" % user_id, station_code)
+
+    async def get_favorites_stations(self, user_id: int) -> typing.Iterable[str]:
+        """
+        Gets the codes of the user's favorite stations.
+        """
+        return await self.connection.smembers("ns:%s:favorites" % user_id, encoding="utf-8")
 
     def close(self):
         self.connection.close()
@@ -273,12 +284,12 @@ class StationIndex:
         self.code_station = {
             station.code: station
             for station in stations
-        }
+        }  # type: typing.Dict[str, Ns.Station]
         self.name_station = {
             name.lower(): station
             for station in stations
             for name in station.names
-        }
+        }  # type: typing.Dict[str, Ns.Station]
         self.names = list(self.name_station)
 
     def search(self, query: str) -> typing.List[Ns.Station]:
@@ -299,8 +310,8 @@ class StationIndex:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Bot:
-    LIMIT = 10
-    TIMEOUT = 10
+    LIMIT = 100
+    TIMEOUT = 60
 
     KEY_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
     KEY_SEARCH = {"text": "Search Station", "callback_data": "/search"}
@@ -320,7 +331,7 @@ class Bot:
         self.botan = botan
         self.ns = ns
         self.db = None  # type: Database
-        self.stations = None
+        self.stations = None  # type: StationIndex
         self.offset = 0
         self.is_stopped = False
 
@@ -356,13 +367,13 @@ class Bot:
             self.offset = update["update_id"] + 1
             # Merge message text and callback query data.
             if "message" in update:
-                sender, text = update["message"]["from"], update["message"]["text"]
+                sender, text, location = update["message"]["from"], update["message"]["text"], update["message"].get("location")
             elif "callback_query" in update:
-                sender, text = update["callback_query"]["from"], update["callback_query"]["data"]
+                sender, text, location = update["callback_query"]["from"], update["callback_query"]["data"], None
             else:
                 continue
             try:
-                await self.handle_message(sender, text)
+                await self.handle_message(sender, text, location)
                 if "callback_query" in update:
                     await self.telegram.answer_callback_query(update["callback_query"]["id"])
             except Exception:
@@ -374,13 +385,16 @@ class Bot:
                 raise
 
     async def get_default_keyboard(self, user_id: int) -> str:
-        # TODO: return station buttons.
         # TODO: return manage/delete button if there is any station.
-        return json.dumps({"inline_keyboard": [
-            [self.KEY_DEPARTURES, self.KEY_SEARCH, self.KEY_CONTACT],
-        ]})
+        station_codes = await self.db.get_favorites_stations(user_id)
+        buttons = [
+            [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/go %s" % station_code}]
+            for station_code in station_codes
+        ]
+        buttons.extend([[self.KEY_SEARCH, self.KEY_CONTACT]])
+        return json.dumps({"inline_keyboard": buttons})
 
-    async def handle_message(self, sender: dict, text: str):
+    async def handle_message(self, sender: dict, text: str, location: dict):
         """
         Handle single message from a user.
         """
@@ -388,16 +402,20 @@ class Bot:
             command, *arguments = text.split()
             if command == "/start":
                 await self.handle_start(sender)
-                await self.botan.track(sender["id"], "Start")
             elif command == "/search":
                 await self.handle_search(sender)
-                await self.botan.track(sender["id"], "Search")
             elif command == "/cancel":
                 await self.handle_cancel(sender)
-                await self.botan.track(sender["id"], "Cancel")
+            elif command == "/add":
+                await self.handle_add(sender, arguments)
+            elif command == "/go":
+                if len(arguments) == 1:
+                    await self.handle_go_from(sender, arguments[0])
+                elif len(arguments) == 2:
+                    await self.handle_go_from_to(sender, arguments[0], arguments[1])
+            # TODO: handle location.
         else:
             await self.handle_search_query(sender, text)
-            await self.botan.track(sender["id"], "Search")
 
     async def handle_start(self, sender: dict):
         """
@@ -409,6 +427,7 @@ class Bot:
             parse_mode=ParseMode.markdown,
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
+        await self.botan.track(sender["id"], "Start")
 
     async def handle_cancel(self, sender: dict):
         """
@@ -416,9 +435,10 @@ class Bot:
         """
         await self.telegram.send_message(
             sender["id"],
-            Responses.DEFAULT,
+            Responses.DEFAULT.format(sender=sender),
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
+        await self.botan.track(sender["id"], "Cancel")
 
     async def handle_search(self, sender: dict):
         """
@@ -429,6 +449,48 @@ class Bot:
             Responses.SEARCH,
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
+        await self.botan.track(sender["id"], "Search")
+
+    async def handle_add(self, sender: dict, station_codes: typing.Iterable[str]):
+        """
+        Handles /add command.
+        """
+        for station_code in station_codes:
+            await self.db.add_favorite_station(sender["id"], station_code)
+            await self.botan.track(sender["id"], "Add", station_code=station_code)
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.ADDED,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
+        )
+
+    async def handle_go_from(self, sender: dict, departure_code: str):
+        """
+        Handles /go command with one argument provided.
+        """
+        station_codes = await self.db.get_favorites_stations(sender["id"])
+        buttons = [
+            [{
+                "text": self.stations.code_station[destination_code].long_name,
+                "callback_data": "/go %s %s" % (departure_code, destination_code),
+            }]
+            for destination_code in station_codes
+            if destination_code != departure_code
+        ]
+        buttons.append([self.KEY_CANCEL])
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.SELECT_DESTINATION,
+            reply_markup=json.dumps({"inline_keyboard": buttons}),
+        )
+        await self.botan.track(sender["id"], "From", station_code=departure_code)
+
+    async def handle_go_from_to(self, sender: dict, departure_code: str, arrival_code: str):
+        """
+        Handles /go command with two arguments provided.
+        """
+        # TODO: plan a trip.
+        # TODO: add to favorite trips.
 
     async def handle_search_query(self, sender: dict, text: str):
         """
@@ -453,6 +515,7 @@ class Bot:
                 Responses.NO_SEARCH_RESULTS,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
             )
+        await self.botan.track(sender["id"], "Query", query=text)
 
 
 # Entry point.
