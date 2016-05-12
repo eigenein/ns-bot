@@ -67,6 +67,7 @@ class Emoji:
     STATION = chr(0x1F689)
     TRAIN = chr(0x1F686)
     TWISTED_RIGHTWARDS_ARROWS = chr(0x1F500)
+    UPWARDS_BLACK_ARROW = chr(0x2B06)
     WARNING_SIGN = chr(0x26A0)
     WHITE_QUESTION_MARK_ORNAMENT = chr(0x2754)
 
@@ -95,19 +96,18 @@ class Responses:
         "{emoji.TRAIN} {{departure.train_type}} _{{departure.route_text}}_",
     )).format(emoji=Emoji)
 
-    # Stop = collections.namedtuple("Stop", ["name", "time", "platform", "is_platform_changed", "delay_text"])
-
     JOURNEY = "\n".join((
         "{emoji.ALARM_CLOCK} *{{journey.actual_departure_time:%-H:%M}}* → _{{duration}}_ → *{{journey.actual_arrival_time:%-H:%M}}*",
+        "",
         "{{components_text}}",
     )).format(emoji=Emoji)
 
-    COMPONENT = "\n".join((
-        "{emoji.TRAIN} _{{component.transport_type}}_",
-        "*{{first_stop.name}}* → *{{last_stop.name}}*",
-        "{emoji.ALARM_CLOCK} *{{first_stop.time:%-H:%M}}* {emoji.STATION} *{{first_stop.platform}}*{{first_stop_warning}} →"
-        " {emoji.ALARM_CLOCK} *{{last_stop.time:%-H:%M}}* {emoji.STATION} *{{last_stop.platform}}*{{last_stop_warning}}",
-    )).format(emoji=Emoji)
+    COMPONENT = (
+        "{{i}}. {emoji.TRAIN} _{{component.transport_type}}_ will depart at *{{first_stop.time:%-H:%M}}* from platform"
+        " *{{first_stop.platform}}*{{first_stop_warning}} in *{{first_stop.name}}*"
+        " and arrive at *{{last_stop.time:%-H:%M}}* to platform *{{last_stop.platform}}*{{last_stop_warning}}"
+        " in *{{last_stop.name}}*."
+    ).format(emoji=Emoji)
 
     DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a journey."
     ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
@@ -473,12 +473,13 @@ class Bot:
     LIMIT = 100
     TIMEOUT = 60
 
+    JOURNEY_COUNT = 2
+    DEPARTURE_COUNT = 5
+
     BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
     BUTTON_SEARCH = {"text": "Search Station", "callback_data": "/search"}
     BUTTON_FEEDBACK = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
     BUTTON_BACK = {"text": "Back", "callback_data": "/cancel"}
-
-    KEYBOARD_BACK = json.dumps({"inline_keyboard": [[BUTTON_BACK]]})
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -684,7 +685,7 @@ class Bot:
             logging.debug("Journeys from %s to %s are not cached.", departure_code, destination_code)
             journeys = await self.ns.plan_journey(departure_code, destination_code)
             await self.db.set_journeys(departure_code, destination_code, journeys)
-        journeys = journeys[:5]
+        journeys = journeys[:self.JOURNEY_COUNT]
 
         departure_name = self.stations.code_station[departure_code].long_name
         destination_name = self.stations.code_station[destination_code].long_name
@@ -693,15 +694,16 @@ class Bot:
             Responses.JOURNEY.format(
                 journey=journey,
                 duration=(journey.actual_duration or journey.planned_duration),
-                components_text="\n".join(
+                components_text="\n\n".join(
                     Responses.COMPONENT.format(
+                        i=i,
                         component=component,
                         first_stop=component.stops[0],
-                        first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else " "),
+                        first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else ""),
                         last_stop=component.stops[-1],
-                        last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else " "),
+                        last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else ""),
                     )
-                    for component in journey.components
+                    for i, component in enumerate(journey.components, start=1)
                 ),
             ) for journey in journeys
         )
@@ -716,10 +718,10 @@ class Bot:
                 text,
                 parse_mode=ParseMode.markdown,
                 reply_markup=json.dumps({
-                    "inline_keyboard": [
-                        [{"text": "Refresh", "callback_data": "/go %s %s" % (departure_code, destination_code)}],
-                        [self.BUTTON_BACK],
-                    ],
+                    "inline_keyboard": [[
+                        self.BUTTON_BACK,
+                        {"text": "Refresh", "callback_data": "/go %s %s" % (departure_code, destination_code)},
+                    ]],
                 }),
             ),
             self.botan.track(user_id, "Plan", departure_code=departure_code, destination_code=destination_code),
@@ -734,7 +736,7 @@ class Bot:
             logging.debug("Departures from %s are not cached.", station_code)
             departures = await self.ns.departures(station_code)
             await self.db.set_departures(station_code, departures)
-        departures = departures[:5]
+        departures = departures[:self.DEPARTURE_COUNT]
 
         departures_text = "\n\n".join(
             Responses.DEPARTURE.format(
@@ -754,7 +756,9 @@ class Bot:
                 user_id,
                 text,
                 parse_mode=ParseMode.markdown,
-                reply_markup=self.KEYBOARD_BACK,
+                reply_markup=json.dumps({"inline_keyboard": [
+                    [self.BUTTON_BACK, {"text": "Refresh", "callback_data": "/departures %s" % station_code}],
+                ]})
             ),
             self.botan.track(user_id, "Departures", station_code=station_code),
         )
