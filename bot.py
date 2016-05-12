@@ -10,6 +10,7 @@ The bot can plan a trip with NS trains via their recommendations service.
 import asyncio
 import collections
 import contextlib
+import datetime
 import difflib
 import enum
 import json
@@ -59,9 +60,12 @@ def main(config_file: click.File, log_file: click.File, verbose: bool):
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Emoji:
+    ALARM_CLOCK = chr(0x23F0)
     BLACK_SUN_WITH_RAYS = chr(0x2600)
     PENSIVE_FACE = chr(0x1F614)
+    STATION = chr(0x1F689)
     TRAIN = chr(0x1F686)
+    WARNING_SIGN = chr(0x26A0)
     WHITE_QUESTION_MARK_ORNAMENT = chr(0x2754)
 
 
@@ -69,19 +73,25 @@ class Emoji:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Responses:
-    START = (
-        "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
-        "\n"
-        "You can add your favorite station simply by sending me its name. Small typos are okay.\n"
-        "\n"
-        "You can also send me your location to see departures from the nearest station."
-    ).format(emoji=Emoji)
+    START = "\n".join((
+        "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}",
+        "",
+        "You can add your favorite station simply by sending me its name. Small typos are okay.",
+        "",
+        "You can also send me your location to see departures from the nearest station.",
+    )).format(emoji=Emoji)
 
-    ERROR = (
-        "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}\n"
-        "\n"
-        "Maybe try again later."
-    ).format(emoji=Emoji)
+    ERROR = "\n".join((
+        "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}",
+        "",
+        "Maybe try again later.",
+    )).format(emoji=Emoji)
+
+    DEPARTURE = "\n".join((
+        "*{{departure.destination}}*",
+        "{emoji.ALARM_CLOCK} *{{departure.time:%-H:%M}}* _{{departure.delay_text}}_ {emoji.STATION} *{{departure.platform}}{{platform_changed}}*",
+        "{emoji.TRAIN} {{departure.train_type}} _{{departure.route_text}}_",
+    )).format(emoji=Emoji)
 
     DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a trip."
     ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
@@ -91,6 +101,8 @@ class Responses:
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
     SELECT_DESTINATION = "Ok, where would you like to go?"
     LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
+    DEPARTURES = "Departures from *{station_name}*:\n\n{departures_text}"
+    NO_DEPARTURES = "No departures found from *{station_name}*."
 
 
 # Redis wrapper.
@@ -276,6 +288,7 @@ class Botan:
 
 class Ns:
     Station = collections.namedtuple("Station", "code long_name names latitude longitude")
+    Departure = collections.namedtuple("Departure", "train_id time delay delay_text destination train_type route_text platform is_platform_changed")
 
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
@@ -287,17 +300,40 @@ class Ns:
         stations = []
         async with self.session.get("http://webservices.ns.nl/ns-api-stations-v2") as response:
             stations_element = ElementTree.fromstring(await response.text())
-            for station_element in stations_element:
-                names = {element.text for element in station_element.find("Namen")}
-                names.update(element.text for element in station_element.find("Synoniemen"))
-                stations.append(Ns.Station(
-                    code=station_element.find("Code").text,
-                    long_name=station_element.find("Namen").find("Lang").text,
-                    names=names,
-                    latitude=float(station_element.find("Lat").text),
-                    longitude=float(station_element.find("Lon").text),
-                ))
+        for station_element in stations_element:
+            names = {element.text for element in station_element.find("Namen")}
+            names.update(element.text for element in station_element.find("Synoniemen"))
+            stations.append(Ns.Station(
+                code=station_element.find("Code").text,
+                long_name=station_element.find("Namen").find("Lang").text,
+                names=names,
+                latitude=float(station_element.find("Lat").text),
+                longitude=float(station_element.find("Lon").text),
+            ))
         return stations
+
+    async def departures(self, station_code: str):
+        logging.debug("Departures: %s.", station_code)
+        async with self.session.get("http://webservices.ns.nl/ns-api-avt", params={"station": station_code}) as response:
+            departures_element = ElementTree.fromstring(await response.text())
+        return [
+            Ns.Departure(
+                train_id=departure_element.find("RitNummer").text,
+                time=datetime.datetime.strptime(departure_element.find("VertrekTijd").text, "%Y-%m-%dT%H:%M:%S%z"),
+                delay=self.element_text(departure_element.find("VertrekVertraging")),
+                delay_text=self.element_text(departure_element.find("VertrekVertragingTekst")),
+                destination=departure_element.find("EindBestemming").text,
+                train_type=departure_element.find("TreinSoort").text,
+                route_text=self.element_text(departure_element.find("RouteTekst")),
+                platform=departure_element.find("VertrekSpoor").text,
+                is_platform_changed=departure_element.find("VertrekSpoor").attrib["wijziging"] == "true",
+            )
+            for departure_element in departures_element
+        ]
+
+    @staticmethod
+    def element_text(element):
+        return element.text if element is not None else ""
 
     def close(self):
         self.session.close()
@@ -343,6 +379,8 @@ class Bot:
     BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
     BUTTON_SEARCH = {"text": "Search Station", "callback_data": "/search"}
     BUTTON_FEEDBACK = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
+
+    KEYBOARD_BACK = json.dumps({"inline_keyboard": [[{"text": "Back", "callback_data": "/cancel"}]]})
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -525,7 +563,11 @@ class Bot:
         Handles /go command with one argument provided.
         """
         buttons = await self.get_go_buttons_from(user_id, departure_code)
-        buttons.append([{"text": "Delete station", "callback_data": "/delete %s" % departure_code}, self.BUTTON_CANCEL])
+        buttons.append([
+            {"text": "Delete station", "callback_data": "/delete %s" % departure_code},
+            {"text": "Departures", "callback_data": "/departures %s" % departure_code},
+            self.BUTTON_CANCEL,
+        ])
         await asyncio.gather(
             self.telegram.send_message(
                 user_id,
@@ -544,8 +586,31 @@ class Bot:
         pass
 
     async def handle_departures(self, user_id: int, station_code: str):
-        # TODO.
-        pass
+        """
+        Handles /departure command.
+        """
+        departures = (await self.ns.departures(station_code))[:5]
+        departures_text = "\n\n".join(
+            Responses.DEPARTURE.format(
+                departure=departure,
+                platform_changed=(" %s" % Emoji.WARNING_SIGN if departure.is_platform_changed else " "),
+            ).rstrip()
+            for departure in departures
+        )
+        station_name = self.stations.code_station[station_code].long_name
+        text = (
+            Responses.DEPARTURES.format(station_name=station_name, departures_text=departures_text) if departures
+            else Responses.NO_DEPARTURES.format(station_name=station_name)
+        )
+        await asyncio.gather(
+            self.telegram.send_message(
+                user_id,
+                text,
+                parse_mode=ParseMode.markdown,
+                reply_markup=self.KEYBOARD_BACK,
+            ),
+            self.botan.track(user_id, "Departures", station_code=station_code),
+        )
 
     async def handle_location(self, user_id: int, latitude: float, longitude: float):
         # Find the nearest station.
