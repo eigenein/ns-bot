@@ -51,7 +51,7 @@ def main(config_file: click.File, log_file: click.File, verbose: bool):
                         asyncio.get_event_loop().run_forever()
                     finally:
                         bot.stop()
-                        # TODO: graceful stop.
+                        # TODO: graceful stop finishing all the pending tasks.
 
 
 # Emoji.
@@ -84,6 +84,7 @@ class Responses:
 
     DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a trip."
     ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
+    DELETED = "It’s deleted. You can always add it back later."
     SEARCH = "Just send me a station name. You can do that whenever you want."
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
@@ -109,6 +110,9 @@ class Database:
         Gets the codes of the user's favorite stations.
         """
         return await self.connection.smembers("ns:%s:favorites" % user_id, encoding="utf-8")
+
+    async def delete_favorite_station(self, user_id, station_code: str):
+        await self.connection.srem("ns:%s:favorites" % user_id, station_code)
 
     def close(self):
         self.connection.close()
@@ -385,7 +389,6 @@ class Bot:
                 raise
 
     async def get_default_keyboard(self, user_id: int) -> str:
-        # TODO: return manage/delete button if there is any station.
         station_codes = await self.db.get_favorites_stations(user_id)
         buttons = [
             [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/go %s" % station_code}]
@@ -408,12 +411,15 @@ class Bot:
                 await self.handle_cancel(sender)
             elif command == "/add":
                 await self.handle_add(sender, arguments)
+            elif command == "/delete":
+                if arguments:
+                    await self.handle_delete(sender, arguments[0])
             elif command == "/go":
                 if len(arguments) == 1:
                     await self.handle_go_from(sender, arguments[0])
                 elif len(arguments) == 2:
                     await self.handle_go_from_to(sender, arguments[0], arguments[1])
-            # TODO: handle location.
+            # TODO: handle location: show departures, add to favs, show destinations.
         else:
             await self.handle_search_query(sender, text)
 
@@ -464,6 +470,19 @@ class Bot:
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
 
+    async def handle_delete(self, sender: dict, station_code: str):
+        """
+        Handles /delete command.
+        """
+        await self.db.delete_favorite_station(sender["id"], station_code)
+        await self.botan.track(sender["id"], "Delete", station_code=station_code)
+
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.DELETED,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
+        )
+
     async def handle_go_from(self, sender: dict, departure_code: str):
         """
         Handles /go command with one argument provided.
@@ -477,7 +496,7 @@ class Bot:
             for destination_code in station_codes
             if destination_code != departure_code
         ]
-        buttons.append([self.KEY_CANCEL])
+        buttons.append([{"text": "Delete station", "callback_data": "/delete %s" % departure_code}, self.KEY_CANCEL])
         await self.telegram.send_message(
             sender["id"],
             Responses.SELECT_DESTINATION,
