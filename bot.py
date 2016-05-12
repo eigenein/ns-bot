@@ -104,12 +104,12 @@ class Responses:
 
     COMPONENT = (
         "{{i}}. {emoji.TRAIN} _{{component.transport_type}}_ will depart at *{{first_stop.time:%-H:%M}}* from platform"
-        " *{{first_stop.platform}}*{{first_stop_warning}} in *{{first_stop.name}}*"
+        " *{{first_stop.platform}}*{{first_stop_warning}} on *{{first_stop.name}}*"
         " and arrive at *{{last_stop.time:%-H:%M}}* to platform *{{last_stop.platform}}*{{last_stop_warning}}"
-        " in *{{last_stop.name}}*."
+        " on *{{last_stop.name}}*."
     ).format(emoji=Emoji)
 
-    DEFAULT = "Hi {sender[first_name]}! Tap a departure station to plan a journey."
+    DEFAULT = "*Hi {sender[first_name]}!* Tap a departure station to plan a journey."
     ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
     DELETED = "It’s deleted. You can always add it back later."
     SEARCH = "Just send me a station name. You can do that whenever you want."
@@ -347,8 +347,6 @@ Stop = collections.namedtuple("Stop", ["name", "time", "platform", "is_platform_
 
 
 class Ns:
-    TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
-
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
 
@@ -378,7 +376,7 @@ class Ns:
         return [
             Departure(
                 train_id=element.find("RitNummer").text,
-                time=datetime.datetime.strptime(element.find("VertrekTijd").text, self.TIME_FORMAT),
+                time=self.strptime(element.find("VertrekTijd").text),
                 delay=self.element_text(element.find("VertrekVertraging")),
                 delay_text=self.element_text(element.find("VertrekVertragingTekst")),
                 destination=element.find("EindBestemming").text,
@@ -405,15 +403,15 @@ class Ns:
                 planned_duration=element.find("GeplandeReisTijd").text,
                 actual_duration=self.element_text(element.find("ActueleReisTijd")),
                 is_optimal=element.find("Optimaal").text == "true",
-                actual_departure_time=datetime.datetime.strptime(element.find("ActueleVertrekTijd").text, self.TIME_FORMAT),
-                actual_arrival_time=datetime.datetime.strptime(element.find("ActueleAankomstTijd").text, self.TIME_FORMAT),
+                actual_departure_time=self.strptime(element.find("ActueleVertrekTijd").text),
+                actual_arrival_time=self.strptime(element.find("ActueleAankomstTijd").text),
                 components=[
                     JourneyComponent(
                         transport_type=component.find("VervoerType").text,
                         stops=[
                             Stop(
                                 name=stop.find("Naam").text,
-                                time=datetime.datetime.strptime(stop.find("Tijd").text, self.TIME_FORMAT),
+                                time=self.strptime(stop.find("Tijd").text),
                                 platform=self.element_text(stop.find("Spoor")),
                                 is_platform_changed=self.element_attribute(stop.find("Spoor"), "wijziging", "") == "true",
                                 delay_text=self.element_text(stop.find("VertrekVertraging")),
@@ -423,6 +421,10 @@ class Ns:
                 ]
             ) for element in root
         ]
+
+    @staticmethod
+    def strptime(time_string: str):
+        return datetime.datetime.strptime(time_string, "%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
     @staticmethod
     def element_text(element):
@@ -619,6 +621,7 @@ class Bot:
             self.telegram.send_message(
                 sender["id"],
                 Responses.DEFAULT.format(sender=sender),
+                parse_mode=ParseMode.markdown,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
             ),
             self.botan.track(sender["id"], "Cancel"),
@@ -684,6 +687,9 @@ class Bot:
         if journeys is None:
             logging.debug("Journeys from %s to %s are not cached.", departure_code, destination_code)
             journeys = await self.ns.plan_journey(departure_code, destination_code)
+            # Sometimes NS API returns too old journeys.
+            now = datetime.datetime.now()
+            journeys = [journey for journey in journeys if journey.actual_departure_time >= now]
             await self.db.set_journeys(departure_code, destination_code, journeys)
         journeys = journeys[:self.JOURNEY_COUNT]
 
@@ -735,6 +741,9 @@ class Bot:
         if departures is None:
             logging.debug("Departures from %s are not cached.", station_code)
             departures = await self.ns.departures(station_code)
+            now = datetime.datetime.now()
+            # Sometimes NS API returns too old departures.
+            departures = [departure for departure in departures if departure.time >= now]
             await self.db.set_departures(station_code, departures)
         departures = departures[:self.DEPARTURE_COUNT]
 
