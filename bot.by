@@ -14,6 +14,7 @@ import difflib
 import enum
 import json
 import logging
+import math
 import typing
 
 from xml.etree import ElementTree
@@ -89,6 +90,7 @@ class Responses:
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
     SELECT_DESTINATION = "Ok, where would you like to go?"
+    LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
 
 
 # Redis wrapper.
@@ -192,6 +194,27 @@ class Telegram:
             params["show_alert"] = show_alert
         return await self.post("answerCallbackQuery", **params)
 
+    async def send_location(
+        self,
+        chat_id: typing.Union[int, str],
+        latitude: float,
+        longitude: float,
+        disable_notification=False,
+        reply_to_message_id=None,
+        reply_markup=None,
+    ):
+        """
+        https://core.telegram.org/bots/api#sendlocation
+        """
+        params = {"chat_id": chat_id, "latitude": latitude, "longitude": longitude}
+        if disable_notification:
+            params["disable_notification"] = disable_notification
+        if reply_to_message_id:
+            params["reply_to_message_id"] = reply_to_message_id
+        if reply_markup:
+            params["reply_markup"] = reply_markup
+        return await self.post("sendLocation", **params)
+
     async def post(self, method: str, **kwargs):
         logging.debug("%s(%s)", method, kwargs)
         async with self.session.post(self._url.format(method), data=json.dumps(kwargs), headers=self.HEADERS) as response:
@@ -227,7 +250,7 @@ class Botan:
         self.token = token
         self.session = aiohttp.ClientSession()
 
-    async def track(self, uid: typing.Optional[str], name: str, **kwargs):
+    async def track(self, uid: typing.Union[None, str, int], name: str, **kwargs):
         """
         Tracks event.
         """
@@ -317,10 +340,9 @@ class Bot:
     LIMIT = 100
     TIMEOUT = 60
 
-    KEY_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
-    KEY_SEARCH = {"text": "Search Station", "callback_data": "/search"}
-    KEY_DEPARTURES = {"text": "Departures", "callback_data": "/departures"}
-    KEY_CONTACT = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
+    BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
+    BUTTON_SEARCH = {"text": "Search Station", "callback_data": "/search"}
+    BUTTON_FEEDBACK = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -371,10 +393,16 @@ class Bot:
             self.offset = update["update_id"] + 1
             # Merge message text and callback query data.
             if "message" in update:
-                sender, text, location = update["message"]["from"], update["message"]["text"], update["message"].get("location")
+                sender = update["message"]["from"]
+                text = update["message"].get("text")
+                location = update["message"].get("location")
             elif "callback_query" in update:
-                sender, text, location = update["callback_query"]["from"], update["callback_query"]["data"], None
+                sender = update["callback_query"]["from"]
+                text = update["callback_query"]["data"]
+                location = None
             else:
+                continue
+            if not text and not location:
                 continue
             try:
                 await self.handle_message(sender, text, location)
@@ -394,35 +422,38 @@ class Bot:
             [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/go %s" % station_code}]
             for station_code in station_codes
         ]
-        buttons.extend([[self.KEY_SEARCH, self.KEY_CONTACT]])
+        buttons.extend([[self.BUTTON_SEARCH, self.BUTTON_FEEDBACK]])
         return json.dumps({"inline_keyboard": buttons})
 
     async def handle_message(self, sender: dict, text: str, location: dict):
         """
         Handle single message from a user.
         """
-        if text.startswith("/"):
+        if text and text.startswith("/"):
             command, *arguments = text.split()
             if command == "/start":
                 await self.handle_start(sender)
             elif command == "/search":
-                await self.handle_search(sender)
+                await self.handle_search(sender["id"])
             elif command == "/cancel":
                 await self.handle_cancel(sender)
             elif command == "/add":
-                await self.handle_add(sender, arguments)
+                await self.handle_add(sender["id"], arguments)
             elif command == "/delete":
                 if arguments:
-                    await self.handle_delete(sender, arguments[0])
+                    await self.handle_delete(sender["id"], arguments[0])
             elif command == "/go":
                 if len(arguments) == 1:
-                    await self.handle_go_from(sender, arguments[0])
+                    await self.handle_go_from(sender["id"], arguments[0])
                 elif len(arguments) == 2:
-                    await self.handle_go_from_to(sender, arguments[0], arguments[1])
-            elif location:
-                await self.handle_location(sender, location["lat"], location["lon"])
-        else:
+                    await self.handle_go_from_to(sender["id"], arguments[0], arguments[1])
+            elif command == "/departures":
+                if len(arguments) == 1:
+                    await self.handle_departures(sender["id"], arguments[0])
+        elif text:
             await self.handle_search_query(sender, text)
+        elif location:
+            await self.handle_location(sender["id"], location["latitude"], location["longitude"])
 
     async def handle_start(self, sender: dict):
         """
@@ -447,65 +478,58 @@ class Bot:
         )
         await self.botan.track(sender["id"], "Cancel")
 
-    async def handle_search(self, sender: dict):
+    async def handle_search(self, user_id: int):
         """
         Handles /search command.
         """
         await self.telegram.send_message(
-            sender["id"],
+            user_id,
             Responses.SEARCH,
-            reply_markup=(await self.get_default_keyboard(sender["id"])),
+            reply_markup=(await self.get_default_keyboard(user_id)),
         )
-        await self.botan.track(sender["id"], "Search")
+        await self.botan.track(user_id, "Search")
 
-    async def handle_add(self, sender: dict, station_codes: typing.Iterable[str]):
+    async def handle_add(self, user_id: int, station_codes: typing.Iterable[str]):
         """
         Handles /add command.
         """
         for station_code in station_codes:
-            await self.db.add_favorite_station(sender["id"], station_code)
+            await self.db.add_favorite_station(user_id, station_code)
         await self.telegram.send_message(
-            sender["id"],
+            user_id,
             Responses.ADDED,
-            reply_markup=(await self.get_default_keyboard(sender["id"])),
+            reply_markup=(await self.get_default_keyboard(user_id)),
         )
         for station_code in station_codes:
-            await self.botan.track(sender["id"], "Add", station_code=station_code)
+            await self.botan.track(user_id, "Add", station_code=station_code)
 
-    async def handle_delete(self, sender: dict, station_code: str):
+    async def handle_delete(self, user_id: int, station_code: str):
         """
         Handles /delete command.
         """
-        await self.db.delete_favorite_station(sender["id"], station_code)
+        await self.db.delete_favorite_station(user_id, station_code)
         await self.telegram.send_message(
-            sender["id"],
+            user_id,
             Responses.DELETED,
-            reply_markup=(await self.get_default_keyboard(sender["id"])),
+            reply_markup=(await self.get_default_keyboard(user_id)),
         )
-        await self.botan.track(sender["id"], "Delete", station_code=station_code)
+        await self.botan.track(user_id, "Delete", station_code=station_code)
 
-    async def handle_go_from(self, sender: dict, departure_code: str):
+    async def handle_go_from(self, user_id: int, departure_code: str):
         """
         Handles /go command with one argument provided.
         """
-        station_codes = await self.db.get_favorites_stations(sender["id"])
-        buttons = [
-            [{
-                "text": self.stations.code_station[destination_code].long_name,
-                "callback_data": "/go %s %s" % (departure_code, destination_code),
-            }]
-            for destination_code in station_codes
-            if destination_code != departure_code
-        ]
-        buttons.append([{"text": "Delete station", "callback_data": "/delete %s" % departure_code}, self.KEY_CANCEL])
+        station_codes = await self.db.get_favorites_stations(user_id)
+        buttons = await self.get_go_buttons_from(user_id, departure_code)
+        buttons.append([{"text": "Delete station", "callback_data": "/delete %s" % departure_code}, self.BUTTON_CANCEL])
         await self.telegram.send_message(
-            sender["id"],
+            user_id,
             Responses.SELECT_DESTINATION,
             reply_markup=json.dumps({"inline_keyboard": buttons}),
         )
-        await self.botan.track(sender["id"], "From", station_code=departure_code)
+        await self.botan.track(user_id, "From", station_code=departure_code)
 
-    async def handle_go_from_to(self, sender: dict, departure_code: str, arrival_code: str):
+    async def handle_go_from_to(self, user_id: int, departure_code: str, arrival_code: str):
         """
         Handles /go command with two arguments provided.
         """
@@ -513,10 +537,39 @@ class Bot:
         # TODO: propose to add to favorite trips.
         pass
 
-    async def handle_location(self, sender: dict, latitude: float, longitude: float):
-        # TODO: handle location: show departures, add to favs, show destinations.
-        # TODO: track the nearest station.
+    async def handle_departures(self, user_id: int, station_code: str):
+        # TODO.
         pass
+
+    async def handle_location(self, user_id: int, latitude: float, longitude: float):
+        # Find the nearest station.
+        departure_code, station = min(
+            self.stations.code_station.items(),
+            key=lambda item: estimate_distance(item[1].latitude, item[1].longitude, latitude, longitude),
+        )
+        await self.telegram.send_message(
+            user_id,
+            Responses.LOCATION_FOUND.format(station_name=station.long_name),
+            parse_mode=ParseMode.markdown,
+        )
+        # Generate destinations.
+        buttons = await self.get_go_buttons_from(user_id, departure_code)
+        buttons.extend([
+            [
+                {"text": "Add", "callback_data": "/add %s" % station.code},
+                {"text": "Departures", "callback_data": "/departures %s" % station.code},
+                self.BUTTON_CANCEL,
+            ],
+        ])
+        # Send both location and destinations.
+        await self.telegram.send_location(
+            user_id,
+            station.latitude,
+            station.longitude,
+            disable_notification=True,
+            reply_markup={"inline_keyboard": buttons},
+        )
+        await self.botan.track(user_id, "Location", station_code=departure_code)
 
     async def handle_search_query(self, sender: dict, text: str):
         """
@@ -529,7 +582,7 @@ class Bot:
                 [{"text": station.long_name, "callback_data": "/add %s" % station.code}]
                 for station in stations
             ]
-            buttons.append([self.KEY_CANCEL])
+            buttons.append([self.BUTTON_CANCEL])
             await self.telegram.send_message(
                 sender["id"],
                 Responses.SEARCH_RESULTS,
@@ -542,6 +595,30 @@ class Bot:
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
             )
         await self.botan.track(sender["id"], "Query", query=text)
+
+    async def get_go_buttons_from(self, user_id: int, departure_code: str) -> typing.List[typing.List[dict]]:
+        station_codes = await self.db.get_favorites_stations(user_id)
+        return [
+            [{
+                "text": "Go to %s" % self.stations.code_station[destination_code].long_name,
+                "callback_data": "/go %s %s" % (departure_code, destination_code),
+            }]
+            for destination_code in station_codes
+            if destination_code != departure_code
+        ]
+
+
+# Utilities.
+# ----------------------------------------------------------------------------------------------------------------------
+
+def estimate_distance(latitude1: float, longitude1: float, latitude2: float, longitude2: float) -> float:
+    """
+    Estimates distance between two points on the geosphere.
+    http://stackoverflow.com/a/15742266/359730
+    """
+    dx = (longitude2 - longitude1) * math.cos(0.5 * (latitude2 + latitude1))
+    dy = latitude2 - latitude1
+    return 6371 * math.sqrt(dx * dx + dy * dy)
 
 
 # Entry point.
