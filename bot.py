@@ -16,6 +16,7 @@ import enum
 import json
 import logging
 import math
+import pickle
 import typing
 
 from xml.etree import ElementTree
@@ -127,6 +128,16 @@ class Database:
 
     async def delete_favorite_station(self, user_id, station_code: str):
         await self.connection.srem("ns:%s:favorites" % user_id, station_code)
+
+    async def get_departures(self, station_code: str) -> typing.List["Departure"]:
+        """
+        Gets cached departures from the specified station.
+        """
+        serialized_departures = await self.connection.get("ns:%s:departures" % station_code)
+        return pickle.loads(serialized_departures) if serialized_departures else None
+
+    async def set_departures(self, station_code: str, departures):
+        await self.connection.setex("ns:%s:departures" % station_code, 60, pickle.dumps(departures))
 
     def close(self):
         self.connection.close()
@@ -286,10 +297,10 @@ class Botan:
 # NS API.
 # ----------------------------------------------------------------------------------------------------------------------
 
-class Ns:
-    Station = collections.namedtuple("Station", "code long_name names latitude longitude")
-    Departure = collections.namedtuple("Departure", "train_id time delay delay_text destination train_type route_text platform is_platform_changed")
+Station = collections.namedtuple("Station", "code long_name names latitude longitude")
+Departure = collections.namedtuple("Departure", "train_id time delay delay_text destination train_type route_text platform is_platform_changed")
 
+class Ns:
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
 
@@ -303,7 +314,7 @@ class Ns:
         for station_element in stations_element:
             names = {element.text for element in station_element.find("Namen")}
             names.update(element.text for element in station_element.find("Synoniemen"))
-            stations.append(Ns.Station(
+            stations.append(Station(
                 code=station_element.find("Code").text,
                 long_name=station_element.find("Namen").find("Lang").text,
                 names=names,
@@ -317,7 +328,7 @@ class Ns:
         async with self.session.get("http://webservices.ns.nl/ns-api-avt", params={"station": station_code}) as response:
             departures_element = ElementTree.fromstring(await response.text())
         return [
-            Ns.Departure(
+            Departure(
                 train_id=departure_element.find("RitNummer").text,
                 time=datetime.datetime.strptime(departure_element.find("VertrekTijd").text, "%Y-%m-%dT%H:%M:%S%z"),
                 delay=self.element_text(departure_element.find("VertrekVertraging")),
@@ -343,19 +354,19 @@ class Ns:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class StationIndex:
-    def __init__(self, stations: typing.Iterable[Ns.Station]):
+    def __init__(self, stations: typing.Iterable[Station]):
         self.code_station = {
             station.code: station
             for station in stations
-        }  # type: typing.Dict[str, Ns.Station]
+        }  # type: typing.Dict[str, Station]
         self.name_station = {
             name.lower(): station
             for station in stations
             for name in station.names
-        }  # type: typing.Dict[str, Ns.Station]
+        }  # type: typing.Dict[str, Station]
         self.names = list(self.name_station)
 
-    def search(self, query: str) -> typing.List[Ns.Station]:
+    def search(self, query: str) -> typing.List[Station]:
         """
         Searches for unique stations that match the query.
         """
@@ -589,7 +600,12 @@ class Bot:
         """
         Handles /departure command.
         """
-        departures = (await self.ns.departures(station_code))[:5]
+        departures = await self.db.get_departures(station_code)
+        if departures is None:
+            logging.debug("Departures from %s are not cached.", station_code)
+            departures = await self.ns.departures(station_code)
+            await self.db.set_departures(station_code, departures)
+        departures = departures[:5]
         departures_text = "\n\n".join(
             Responses.DEPARTURE.format(
                 departure=departure,
