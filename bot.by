@@ -252,7 +252,7 @@ class Botan:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Ns:
-    Station = collections.namedtuple("Station", "code long_name names lat lon")
+    Station = collections.namedtuple("Station", "code long_name names latitude longitude")
 
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
@@ -271,8 +271,8 @@ class Ns:
                     code=station_element.find("Code").text,
                     long_name=station_element.find("Namen").find("Lang").text,
                     names=names,
-                    lat=station_element.find("Lat").text,
-                    lon=station_element.find("Lon").text,
+                    latitude=float(station_element.find("Lat").text),
+                    longitude=float(station_element.find("Lon").text),
                 ))
         return stations
 
@@ -419,7 +419,8 @@ class Bot:
                     await self.handle_go_from(sender, arguments[0])
                 elif len(arguments) == 2:
                     await self.handle_go_from_to(sender, arguments[0], arguments[1])
-            # TODO: handle location: show departures, add to favs, show destinations.
+            elif location:
+                await self.handle_location(sender, location["lat"], location["lon"])
         else:
             await self.handle_search_query(sender, text)
 
@@ -463,25 +464,25 @@ class Bot:
         """
         for station_code in station_codes:
             await self.db.add_favorite_station(sender["id"], station_code)
-            await self.botan.track(sender["id"], "Add", station_code=station_code)
         await self.telegram.send_message(
             sender["id"],
             Responses.ADDED,
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
+        for station_code in station_codes:
+            await self.botan.track(sender["id"], "Add", station_code=station_code)
 
     async def handle_delete(self, sender: dict, station_code: str):
         """
         Handles /delete command.
         """
         await self.db.delete_favorite_station(sender["id"], station_code)
-        await self.botan.track(sender["id"], "Delete", station_code=station_code)
-
         await self.telegram.send_message(
             sender["id"],
             Responses.DELETED,
             reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
+        await self.botan.track(sender["id"], "Delete", station_code=station_code)
 
     async def handle_go_from(self, sender: dict, departure_code: str):
         """
@@ -509,7 +510,13 @@ class Bot:
         Handles /go command with two arguments provided.
         """
         # TODO: plan a trip.
-        # TODO: add to favorite trips.
+        # TODO: propose to add to favorite trips.
+        pass
+
+    async def handle_location(self, sender: dict, latitude: float, longitude: float):
+        # TODO: handle location: show departures, add to favs, show destinations.
+        # TODO: track the nearest station.
+        pass
 
     async def handle_search_query(self, sender: dict, text: str):
         """
