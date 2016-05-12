@@ -60,6 +60,8 @@ def main(config_file: click.File, log_file: click.File, verbose: bool):
 class Emoji:
     BLACK_SUN_WITH_RAYS = chr(0x2600)
     PENSIVE_FACE = chr(0x1F614)
+    TRAIN = chr(0x1F686)
+    WHITE_QUESTION_MARK_ORNAMENT = chr(0x2754)
 
 
 # Bot response phrases.
@@ -69,21 +71,21 @@ class Responses:
     START = (
         "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}\n"
         "\n"
-        "You can add your favorite station simply by sending me its name."
-        " Also you can take a look at departures from the nearest station."
+        "You can add your favorite station simply by sending me its name. Small typos are okay.\n"
+        "\n"
+        "Also you can quickly take a look at departures from the nearest station."
     ).format(emoji=Emoji)
-
-    DEFAULT = "Ok, where would you like to go?"
-
-    NO_SEARCH_RESULTS = "I couldn’t find any station with this name. Please check it and try again."
-
-    SEARCH_RESULTS = "Please confirm the station and I’ll add it to your favorites."
 
     ERROR = (
         "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}\n"
         "\n"
         "Maybe try again later."
     ).format(emoji=Emoji)
+
+    DEFAULT = "Ok, where would you like to go?"
+    SEARCH = "Just send me a station name. You can do that whenever you want."
+    NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
+    SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
 
 
 # Redis wrapper.
@@ -163,6 +165,17 @@ class Telegram:
         https://core.telegram.org/bots/api#sendchataction
         """
         return await self.post("sendChatAction", chat_id=chat_id, action=action.value)
+
+    async def answer_callback_query(self, callback_query_id: str, text=None, show_alert=False):
+        """
+        https://core.telegram.org/bots/api#answercallbackquery
+        """
+        params = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        if show_alert:
+            params["show_alert"] = show_alert
+        return await self.post("answerCallbackQuery", **params)
 
     async def post(self, method: str, **kwargs):
         logging.debug("%s(%s)", method, kwargs)
@@ -257,21 +270,28 @@ class Ns:
 
 class StationIndex:
     def __init__(self, stations: typing.Iterable[Ns.Station]):
-        self.code_station = {station.code: station for station in stations}
-        self.name_station = {name.lower(): station for station in stations for name in station.names}
+        self.code_station = {
+            station.code: station
+            for station in stations
+        }
+        self.name_station = {
+            name.lower(): station
+            for station in stations
+            for name in station.names
+        }
         self.names = list(self.name_station)
 
     def search(self, query: str) -> typing.List[Ns.Station]:
         """
         Searches for unique stations that match the query.
         """
+        logging.debug("Query: %s", query)
         return [
             self.code_station[code]
-            for code in {
+            for code in collections.OrderedDict.fromkeys(
                 self.name_station[name].code
-                # TODO: preserve order.
                 for name in difflib.get_close_matches(query.lower(), self.names)
-            }
+            )
         ]
 
 
@@ -283,7 +303,17 @@ class Bot:
     TIMEOUT = 10
 
     KEY_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
+    KEY_SEARCH = {"text": "Search Station", "callback_data": "/search"}
     KEY_DEPARTURES = {"text": "Departures", "callback_data": "/departures"}
+    KEY_CONTACT = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
+
+    TRANSLATE_TABLE = {
+        ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
+        ord("з"): "z", ord("и"): "i", ord("й"): "i", ord("к"): "k", ord("л"): "l", ord("м"): "m", ord("н"): "n",
+        ord("о"): "o", ord("п"): "p", ord("р"): "r", ord("с"): "c", ord("т"): "t", ord("у"): "u", ord("ф"): "f",
+        ord("х"): "h", ord("ц"): "c", ord("ч"): "ch", ord("ш"): "sch", ord("щ"): "shch", ord("ъ"): "", ord("ь"): "",
+        ord("э"): "e", ord("ю"): "u", ord("я"): "ya",
+    }
 
     def __init__(self, telegram: Telegram, botan: Botan, ns: Ns):
         self.telegram = telegram
@@ -333,14 +363,22 @@ class Bot:
                 continue
             try:
                 await self.handle_message(sender, text)
+                if "callback_query" in update:
+                    await self.telegram.answer_callback_query(update["callback_query"]["id"])
             except Exception:
-                await self.telegram.send_message(sender["id"], Responses.ERROR)
+                await self.telegram.send_message(
+                    sender["id"],
+                    Responses.ERROR,
+                    reply_markup=(await self.get_default_keyboard(sender["id"])),
+                )
                 raise
 
     async def get_default_keyboard(self, user_id: int) -> str:
         # TODO: return station buttons.
         # TODO: return manage/delete button if there is any station.
-        return json.dumps({"inline_keyboard": [[self.KEY_DEPARTURES]]})
+        return json.dumps({"inline_keyboard": [
+            [self.KEY_DEPARTURES, self.KEY_SEARCH, self.KEY_CONTACT],
+        ]})
 
     async def handle_message(self, sender: dict, text: str):
         """
@@ -351,11 +389,14 @@ class Bot:
             if command == "/start":
                 await self.handle_start(sender)
                 await self.botan.track(sender["id"], "Start")
+            elif command == "/search":
+                await self.handle_search(sender)
+                await self.botan.track(sender["id"], "Search")
             elif command == "/cancel":
                 await self.handle_cancel(sender)
                 await self.botan.track(sender["id"], "Cancel")
         else:
-            await self.handle_search(sender, text)
+            await self.handle_search_query(sender, text)
             await self.botan.track(sender["id"], "Search")
 
     async def handle_start(self, sender: dict):
@@ -366,20 +407,35 @@ class Bot:
             sender["id"],
             Responses.START.format(sender=sender),
             parse_mode=ParseMode.markdown,
-            reply_markup=self.get_default_keyboard(sender["id"]),
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
 
     async def handle_cancel(self, sender: dict):
         """
         Handles /cancel command.
         """
-        await self.telegram.send_message(sender["id"], Responses.DEFAULT, reply_markup=self.get_default_keyboard(sender["id"]))
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.DEFAULT,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
+        )
 
-    async def handle_search(self, sender: dict, text: str):
+    async def handle_search(self, sender: dict):
+        """
+        Handles /search command.
+        """
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.SEARCH,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
+        )
+
+    async def handle_search_query(self, sender: dict, text: str):
         """
         Handles station search.
         """
-        stations = self.stations.search(text.strip())
+        logging.debug("Search: %s", text)
+        stations = self.stations.search(text.strip().translate(self.TRANSLATE_TABLE))
         if stations:
             buttons = [
                 [{"text": station.long_name, "callback_data": "/add %s" % station.code}]
@@ -395,7 +451,7 @@ class Bot:
             await self.telegram.send_message(
                 sender["id"],
                 Responses.NO_SEARCH_RESULTS,
-                reply_markup=self.get_default_keyboard(sender["id"]),
+                reply_markup=(await self.get_default_keyboard(sender["id"])),
             )
 
 
