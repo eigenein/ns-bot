@@ -104,6 +104,8 @@ class Responses:
     LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
     DEPARTURES = "Departures from *{station_name}*:\n\n{departures_text}"
     NO_DEPARTURES = "No departures found from *{station_name}*."
+    TRIPS = "Trips from *{departure_name}* to *{destination_name}*:\n\n{trips_text}"
+    NO_TRIPS = "No trips found from *{departure_name}* to *{destination_name}*."
 
 
 # Redis wrapper.
@@ -297,10 +299,34 @@ class Botan:
 # NS API.
 # ----------------------------------------------------------------------------------------------------------------------
 
-Station = collections.namedtuple("Station", "code long_name names latitude longitude")
-Departure = collections.namedtuple("Departure", "train_id time delay delay_text destination train_type route_text platform is_platform_changed")
+Station = collections.namedtuple("Station", ["code", "long_name", "names", "latitude", "longitude"])
+Departure = collections.namedtuple("Departure", [
+    "train_id",
+    "time",
+    "delay",
+    "delay_text",
+    "destination",
+    "train_type",
+    "route_text",
+    "platform",
+    "is_platform_changed",
+])
+Trip = collections.namedtuple("Trip", [
+    "transfer_count",
+    "planned_duration",
+    "actual_duration",
+    "is_optimal",
+    "actual_departure_time",
+    "actual_arrival_time",
+    "components",
+])
+TripComponent = collections.namedtuple("TripComponent", ["transport_type", "stops"])
+Stop = collections.namedtuple("Stop", ["name", "time", "platform", "is_platform_changed", "delay_text"])
+
 
 class Ns:
+    TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+
     def __init__(self, login: str, password: str):
         self.session = aiohttp.ClientSession(auth=aiohttp.BasicAuth(login=login, password=password))
 
@@ -310,41 +336,79 @@ class Ns:
         """
         stations = []
         async with self.session.get("http://webservices.ns.nl/ns-api-stations-v2") as response:
-            stations_element = ElementTree.fromstring(await response.text())
-        for station_element in stations_element:
-            names = {element.text for element in station_element.find("Namen")}
-            names.update(element.text for element in station_element.find("Synoniemen"))
+            root = ElementTree.fromstring(await response.text())
+        for element in root:
+            names = {element.text for element in element.find("Namen")}
+            names.update(element.text for element in element.find("Synoniemen"))
             stations.append(Station(
-                code=station_element.find("Code").text,
-                long_name=station_element.find("Namen").find("Lang").text,
+                code=element.find("Code").text,
+                long_name=element.find("Namen").find("Lang").text,
                 names=names,
-                latitude=float(station_element.find("Lat").text),
-                longitude=float(station_element.find("Lon").text),
+                latitude=float(element.find("Lat").text),
+                longitude=float(element.find("Lon").text),
             ))
         return stations
 
     async def departures(self, station_code: str):
         logging.debug("Departures: %s.", station_code)
         async with self.session.get("http://webservices.ns.nl/ns-api-avt", params={"station": station_code}) as response:
-            departures_element = ElementTree.fromstring(await response.text())
+            root = ElementTree.fromstring(await response.text())
         return [
             Departure(
-                train_id=departure_element.find("RitNummer").text,
-                time=datetime.datetime.strptime(departure_element.find("VertrekTijd").text, "%Y-%m-%dT%H:%M:%S%z"),
-                delay=self.element_text(departure_element.find("VertrekVertraging")),
-                delay_text=self.element_text(departure_element.find("VertrekVertragingTekst")),
-                destination=departure_element.find("EindBestemming").text,
-                train_type=departure_element.find("TreinSoort").text,
-                route_text=self.element_text(departure_element.find("RouteTekst")),
-                platform=departure_element.find("VertrekSpoor").text,
-                is_platform_changed=departure_element.find("VertrekSpoor").attrib["wijziging"] == "true",
+                train_id=element.find("RitNummer").text,
+                time=datetime.datetime.strptime(element.find("VertrekTijd").text, self.TIME_FORMAT),
+                delay=self.element_text(element.find("VertrekVertraging")),
+                delay_text=self.element_text(element.find("VertrekVertragingTekst")),
+                destination=element.find("EindBestemming").text,
+                train_type=element.find("TreinSoort").text,
+                route_text=self.element_text(element.find("RouteTekst")),
+                platform=element.find("VertrekSpoor").text,
+                is_platform_changed=element.find("VertrekSpoor").attrib["wijziging"] == "true",
             )
-            for departure_element in departures_element
+            for element in root
+        ]
+
+    async def plan_trip(self, departure_code: str, destination_code: str) -> typing.List[Trip]:
+        """
+        http://www.ns.nl/en/travel-information/ns-api/documentation-travel-recommendations.html
+        """
+        async with self.session.get(
+            "http://webservices.ns.nl/ns-api-treinplanner",
+            params={"fromStation": departure_code, "toStation": destination_code},
+        ) as response:
+            root = ElementTree.fromstring(await response.text())
+        return [
+            Trip(
+                transfer_count=int(element.find("AantalOverstappen").text),
+                planned_duration=element.find("GeplandeReisTijd").text,
+                actual_duration=self.element_text(element.find("ActueleReisTijd")),
+                is_optimal=element.find("Optimaal").text == "true",
+                actual_departure_time=datetime.datetime.strptime(element.find("ActueleVertrekTijd").text, self.TIME_FORMAT),
+                actual_arrival_time=datetime.datetime.strptime(element.find("ActueleAankomstTijd").text, self.TIME_FORMAT),
+                components=[
+                    TripComponent(
+                        transport_type=component.find("VervoerType").text,
+                        stops=[
+                            Stop(
+                                name=stop.find("Naam").text,
+                                time=datetime.datetime.strptime(stop.find("Tijd").text, self.TIME_FORMAT),
+                                platform=self.element_text(stop.find("Spoor")),
+                                is_platform_changed=self.element_attribute(stop.find("Spoor"), "wijziging", "") == "true",
+                                delay_text=self.element_text(stop.find("VertrekVertraging")),
+                            ) for stop in component.findall("ReisStop")
+                        ]
+                    ) for component in element.findall("ReisDeel")
+                ]
+            ) for element in root
         ]
 
     @staticmethod
     def element_text(element):
         return element.text if element is not None else ""
+
+    @staticmethod
+    def element_attribute(element, name, default):
+        return element.attrib[name] if element is not None else default
 
     def close(self):
         self.session.close()
@@ -588,13 +652,30 @@ class Bot:
             self.botan.track(user_id, "From", station_code=departure_code),
         )
 
-    async def handle_go_from_to(self, user_id: int, departure_code: str, arrival_code: str):
+    async def handle_go_from_to(self, user_id: int, departure_code: str, destination_code: str):
         """
         Handles /go command with two arguments provided.
         """
-        # TODO: plan a trip.
-        # TODO: propose to add to favorite trips.
-        pass
+        trips = await self.ns.plan_trip(departure_code, destination_code)
+        logging.debug("%d trips found.", len(trips))
+
+        departure_name = self.stations.code_station[departure_code].long_name
+        destination_name = self.stations.code_station[destination_code].long_name
+        trips_text = ""
+        text = (
+            Responses.TRIPS.format(departure_name=departure_name, destination_name=destination_name, trips_text=trips_text)
+            if trips else Responses.NO_TRIPS.format(departure_name=departure_name, destination_name=destination_name)
+        )
+
+        await asyncio.gather(
+            self.telegram.send_message(
+                user_id,
+                text,
+                parse_mode=ParseMode.markdown,
+                reply_markup=self.KEYBOARD_BACK,
+            ),
+            self.botan.track(user_id, "Plan", departure_code=departure_code, destination_code=destination_code),
+        )
 
     async def handle_departures(self, user_id: int, station_code: str):
         """
@@ -606,6 +687,7 @@ class Bot:
             departures = await self.ns.departures(station_code)
             await self.db.set_departures(station_code, departures)
         departures = departures[:5]
+
         departures_text = "\n\n".join(
             Responses.DEPARTURE.format(
                 departure=departure,
@@ -618,6 +700,7 @@ class Bot:
             Responses.DEPARTURES.format(station_name=station_name, departures_text=departures_text) if departures
             else Responses.NO_DEPARTURES.format(station_name=station_name)
         )
+
         await asyncio.gather(
             self.telegram.send_message(
                 user_id,
