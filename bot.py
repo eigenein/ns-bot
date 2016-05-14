@@ -54,7 +54,6 @@ def main(config_file: click.File, log_file: click.File, verbose: bool):
                         asyncio.get_event_loop().run_forever()
                     finally:
                         bot.stop()
-                        # TODO: graceful stop finishing all the pending tasks.
 
 
 # Emoji.
@@ -411,7 +410,7 @@ class Ns:
                         stops=[
                             Stop(
                                 name=stop.find("Naam").text,
-                                time=self.strptime(stop.find("Tijd").text),
+                                time=self.strptime(stop.find("Tijd").text, allow_empty=True),
                                 platform=self.element_text(stop.find("Spoor")),
                                 is_platform_changed=self.element_attribute(stop.find("Spoor"), "wijziging", "") == "true",
                                 delay_text=self.element_text(stop.find("VertrekVertraging")),
@@ -423,7 +422,12 @@ class Ns:
         ]
 
     @staticmethod
-    def strptime(time_string: str):
+    def strptime(time_string: str, allow_empty=False):
+        if not time_string:
+            if allow_empty:
+                return None
+            else:
+                raise ValueError("empty time string")
         return datetime.datetime.strptime(time_string, "%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
     @staticmethod
