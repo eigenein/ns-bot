@@ -9,7 +9,6 @@ The bot can plan a journey with NS trains via their recommendations service.
 
 import asyncio
 import collections
-import contextlib
 import datetime
 import difflib
 import enum
@@ -19,21 +18,23 @@ import math
 import pickle
 import typing
 
+from contextlib import ExitStack, closing
 from xml.etree import ElementTree
 
 import aiohttp
 import aioredis
 import click
 
+import config
+
 
 # CLI Commands.
 # ----------------------------------------------------------------------------------------------------------------------
 
 @click.command()
-@click.option("-c", "--config", "config_file", type=click.File("rt", encoding="utf-8"), help="Configuration file.", required=True)
 @click.option("-l", "--log-file", type=click.File("at", encoding="utf-8"))
 @click.option("-v", "--verbose", type=bool, is_flag=True)
-def main(config_file: click.File, log_file: click.File, verbose: bool):
+def main(log_file: click.File, verbose: bool):
     logging.basicConfig(
         datefmt="%Y-%m-%d %H:%M:%S",
         format="%(asctime)s (%(module)s) [%(levelname)s] %(message)s",
@@ -41,19 +42,17 @@ def main(config_file: click.File, log_file: click.File, verbose: bool):
         stream=(log_file or click.get_text_stream("stderr")),
     )
 
-    logging.info("Reading configuration…")
-    config = json.load(config_file)
-
     logging.info("Starting bot…")
-    with contextlib.closing(Telegram(config["telegram_token"])) as telegram:
-        with contextlib.closing(Botan(config["botan_token"])) as botan:
-            with contextlib.closing(Ns(config["ns_api"]["login"], config["ns_api"]["password"])) as ns:
-                with contextlib.closing(Bot(telegram, botan, ns)) as bot:
-                    try:
-                        asyncio.ensure_future(bot.run())
-                        asyncio.get_event_loop().run_forever()
-                    finally:
-                        bot.stop()
+    with ExitStack() as exit_stack:
+        telegram = exit_stack.enter_context(closing(Telegram(config.TELEGRAM_TOKEN)))
+        botan = exit_stack.enter_context(closing(Botan(config.BOTAN_TOKEN)))
+        ns = exit_stack.enter_context(closing(Ns(config.NS_LOGIN, config.NS_PASSWORD)))
+        bot = exit_stack.enter_context(closing(Bot(telegram, botan, ns)))
+        try:
+            asyncio.ensure_future(bot.run())
+            asyncio.get_event_loop().run_forever()
+        finally:
+            bot.stop()
 
 
 # Emoji.
