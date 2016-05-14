@@ -140,6 +140,9 @@ class Database:
         self.connection = connection
 
     async def add_favorite_station(self, user_id: int, station_code: str):
+        """
+        Adds the station to the user's favorites.
+        """
         await self.connection.sadd("ns:%s:favorites" % user_id, station_code)
 
     async def get_favorites_stations(self, user_id: int) -> typing.Iterable[str]:
@@ -149,6 +152,9 @@ class Database:
         return await self.connection.smembers("ns:%s:favorites" % user_id, encoding="utf-8")
 
     async def delete_favorite_station(self, user_id, station_code: str):
+        """
+        Deletes the station from user's favorites.
+        """
         await self.connection.srem("ns:%s:favorites" % user_id, station_code)
 
     async def get_departures(self, station_code: str) -> typing.List["Departure"]:
