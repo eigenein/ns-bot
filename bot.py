@@ -5,6 +5,13 @@
 What can this bot do?
 
 The bot can plan a journey with NS trains via their recommendations service.
+
+Configuration module should contain the following constants:
+TELEGRAM_TOKEN = "…"  # Telegram Bot API token
+BOTAN_TOKEN = "…"  # Botan.io token
+NS_LOGIN = "…"  # NS API login
+NS_PASSWORD = "…"  # NS API password
+ADMIN_IDS = {…}  # admin chat IDs
 """
 
 import asyncio
