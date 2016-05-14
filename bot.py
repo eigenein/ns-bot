@@ -734,7 +734,13 @@ class Bot:
                     ]],
                 }),
             ),
-            self.botan.track(user_id, "Plan", departure_code=departure_code, destination_code=destination_code),
+            self.botan.track(
+                user_id,
+                "Plan",
+                departure_code=departure_code,
+                destination_code=destination_code,
+                route=("%s-%s" % (departure_code, destination_code)),
+            ),
         )
 
     async def handle_departures(self, user_id: int, station_code: str):
