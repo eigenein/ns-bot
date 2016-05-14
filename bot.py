@@ -356,15 +356,15 @@ class Ns:
         stations = []
         async with self.session.get("http://webservices.ns.nl/ns-api-stations-v2") as response:
             root = ElementTree.fromstring(await response.text())
-        for element in root:
-            names = {element.text for element in element.find("Namen")}
-            names.update(element.text for element in element.find("Synoniemen"))
+        for station in root:
+            names = {element.text for element in station.find("Namen")}
+            names.update(element.text for element in station.find("Synoniemen"))
             stations.append(Station(
-                code=element.find("Code").text,
-                long_name=element.find("Namen").find("Lang").text,
+                code=station.find("Code").text,
+                long_name=station.find("Namen").find("Lang").text,
                 names=names,
-                latitude=float(element.find("Lat").text),
-                longitude=float(element.find("Lon").text),
+                latitude=float(station.find("Lat").text),
+                longitude=float(station.find("Lon").text),
             ))
         return stations
 
@@ -374,17 +374,17 @@ class Ns:
             root = ElementTree.fromstring(await response.text())
         return [
             Departure(
-                train_id=element.find("RitNummer").text,
-                time=self.strptime(element.find("VertrekTijd").text),
-                delay=self.element_text(element.find("VertrekVertraging")),
-                delay_text=self.element_text(element.find("VertrekVertragingTekst")),
-                destination=element.find("EindBestemming").text,
-                train_type=element.find("TreinSoort").text,
-                route_text=self.element_text(element.find("RouteTekst")),
-                platform=element.find("VertrekSpoor").text,
-                is_platform_changed=element.find("VertrekSpoor").attrib["wijziging"] == "true",
+                train_id=departure.find("RitNummer").text,
+                time=self.strptime(departure.find("VertrekTijd").text),
+                delay=self.element_text(departure.find("VertrekVertraging")),
+                delay_text=self.element_text(departure.find("VertrekVertragingTekst")),
+                destination=departure.find("EindBestemming").text,
+                train_type=departure.find("TreinSoort").text,
+                route_text=self.element_text(departure.find("RouteTekst")),
+                platform=departure.find("VertrekSpoor").text,
+                is_platform_changed=departure.find("VertrekSpoor").attrib["wijziging"] == "true",
             )
-            for element in root
+            for departure in root
         ]
 
     async def plan_journey(self, departure_code: str, destination_code: str) -> typing.List[Journey]:
@@ -398,12 +398,12 @@ class Ns:
             root = ElementTree.fromstring(await response.text())
         return [
             Journey(
-                transfer_count=int(element.find("AantalOverstappen").text),
-                planned_duration=element.find("GeplandeReisTijd").text,
-                actual_duration=self.element_text(element.find("ActueleReisTijd")),
-                is_optimal=element.find("Optimaal").text == "true",
-                actual_departure_time=self.strptime(element.find("ActueleVertrekTijd").text),
-                actual_arrival_time=self.strptime(element.find("ActueleAankomstTijd").text),
+                transfer_count=int(journey.find("AantalOverstappen").text),
+                planned_duration=journey.find("GeplandeReisTijd").text,
+                actual_duration=self.element_text(journey.find("ActueleReisTijd")),
+                is_optimal=journey.find("Optimaal").text == "true",
+                actual_departure_time=self.strptime(journey.find("ActueleVertrekTijd").text),
+                actual_arrival_time=self.strptime(journey.find("ActueleAankomstTijd").text),
                 components=[
                     JourneyComponent(
                         transport_type=component.find("VervoerType").text,
@@ -416,9 +416,9 @@ class Ns:
                                 delay_text=self.element_text(stop.find("VertrekVertraging")),
                             ) for stop in component.findall("ReisStop")
                         ]
-                    ) for component in element.findall("ReisDeel")
+                    ) for component in journey.findall("ReisDeel")
                 ]
-            ) for element in root
+            ) for journey in root
         ]
 
     @staticmethod
