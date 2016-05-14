@@ -19,10 +19,12 @@ import collections
 import datetime
 import difflib
 import enum
+import itertools
 import json
 import logging
 import math
 import pickle
+import time
 import typing
 
 from contextlib import ExitStack, closing
@@ -122,16 +124,14 @@ class Responses:
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
     SELECT_DESTINATION = "Ok, where would you like to go?"
     LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
-    DEPARTURES = "Departures from *{station_name}*:\n\n{departures_text}"
-    NO_DEPARTURES = "No departures found from *{station_name}*."
-    JOURNEYS = "Journeys from *{departure_name}* to *{destination_name}*:\n\n{journeys_text}"
-    NO_JOURNEYS = "No journeys found from *{departure_name}* to *{destination_name}*."
 
 
 # Redis wrapper.
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Database:
+    T = typing.TypeVar("T")
+
     @staticmethod
     async def create():
         return Database(await aioredis.create_redis(("localhost", 6379)))
@@ -157,22 +157,29 @@ class Database:
         """
         await self.connection.srem("ns:%s:favorites" % user_id, station_code)
 
-    async def get_departures(self, station_code: str) -> typing.List["Departure"]:
+    async def is_cached(self, sub_key: str):
         """
-        Gets cached departures from the specified station.
+        Gets whether the specified cache key exists.
         """
-        serialized_departures = await self.connection.get("ns:%s:departures" % station_code)
-        return pickle.loads(serialized_departures) if serialized_departures else None
+        return await self.connection.exists("ns:cache:%s" % sub_key)
 
-    async def set_departures(self, station_code: str, departures):
-        await self.connection.setex("ns:%s:departures" % station_code, 60, pickle.dumps(departures))
+    async def put_into_cache(self, sub_key: str, items: typing.Iterable[T], score: typing.Callable[[T], typing.Union[int, float]]):
+        """
+        Puts the items into a sorted set according to their scores.
+        """
+        key = "ns:cache:%s" % sub_key
+        await self.connection.zadd(key, *itertools.chain(*((score(item), pickle.dumps(item)) for item in items)))
+        await self.connection.expire(key, 60)
 
-    async def get_journeys(self, departure_code: str, destination_code: str) -> typing.List["Journey"]:
-        serialized_journeys = await self.connection.get("ns:%s:%s:journeys" % (departure_code, destination_code))
-        return pickle.loads(serialized_journeys) if serialized_journeys else None
+    async def get_previous_from_cache(self, sub_key: str, score: typing.Union[int, float]):
+        items = await self.connection.zrevrangebyscore(
+            "ns:cache:%s" % sub_key, max=score, offset=0, count=1, exclude="ZSET_EXCLUDE_MAX")
+        return pickle.loads(items[0]) if items else None
 
-    async def set_journeys(self, departure_code: str, destination_code: str, journeys):
-        await self.connection.setex("ns:%s:%s:journeys" % (departure_code, destination_code), 60, pickle.dumps(journeys))
+    async def get_next_from_cache(self, sub_key: str, score: typing.Union[int, float]):
+        items = await self.connection.zrangebyscore(
+            "ns:cache:%s" % sub_key, min=score, offset=0, count=1, exclude="ZSET_EXCLUDE_MIN")
+        return pickle.loads(items[0]) if items else None
 
     def close(self):
         self.connection.close()
@@ -234,6 +241,34 @@ class Telegram:
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         return await self.post("sendMessage", **params)
+
+    async def edit_message_text(
+        self,
+        chat_id: typing.Union[None, int, str],
+        message_id: typing.Optional[int],
+        inline_message_id: typing.Optional[str],
+        text: str,
+        parse_mode=ParseMode.default,
+        disable_web_page_preview=False,
+        reply_markup=None,
+    ):
+        """
+        https://core.telegram.org/bots/api#editmessagetext
+        """
+        params = {"text": text}
+        if chat_id:
+            params["chat_id"] = chat_id
+        if message_id:
+            params["message_id"] = message_id
+        if inline_message_id:
+            params["inline_message_id"] = inline_message_id
+        if parse_mode != ParseMode.default:
+            params["parse_mode"] = parse_mode.value
+        if disable_web_page_preview:
+            params["disable_web_page_preview"] = disable_web_page_preview
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
+        return await self.post("editMessageText", **params)
 
     async def send_chat_action(self, chat_id: typing.Union[int, str], action: ChatAction):
         """
@@ -312,6 +347,8 @@ class Botan:
         """
         Tracks event.
         """
+        if not self.token:
+            return
         try:
             async with self.session.post(
                 "https://api.botan.io/track",
@@ -551,21 +588,20 @@ class Bot:
                 sender = update["message"]["from"]
                 text = update["message"].get("text")
                 location = update["message"].get("location")
+                original_message_id = None
             elif "callback_query" in update:
                 sender = update["callback_query"]["from"]
                 text = update["callback_query"]["data"]
                 location = None
+                original_message_id = update["callback_query"].get("message", {}).get("message_id")
             else:
                 continue
             if not text and not location:
                 continue
             try:
-                future = self.handle_message(sender, text, location)
+                future = self.handle_message(sender, original_message_id, text, location)
                 if "callback_query" in update:
-                    await asyncio.gather(
-                        future,
-                        self.telegram.answer_callback_query(update["callback_query"]["id"]),
-                    )
+                    await asyncio.gather(future, self.telegram.answer_callback_query(update["callback_query"]["id"]))
                 else:
                     await future
             except Exception:
@@ -579,13 +615,13 @@ class Bot:
     async def get_default_keyboard(self, user_id: int) -> str:
         station_codes = await self.db.get_favorites_stations(user_id)
         buttons = [
-            [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/go %s" % station_code}]
+            [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/from %s" % station_code}]
             for station_code in station_codes
         ]
         buttons.extend([[self.BUTTON_SEARCH, self.BUTTON_FEEDBACK]])
         return json.dumps({"inline_keyboard": buttons})
 
-    async def handle_message(self, sender: dict, text: str, location: dict):
+    async def handle_message(self, sender: dict, original_message_id: typing.Optional[int], text: str, location: dict):
         """
         Handle single message from a user.
         """
@@ -596,20 +632,35 @@ class Bot:
             elif command == "/search":
                 await self.handle_search(sender["id"])
             elif command == "/cancel":
-                await self.handle_cancel(sender)
+                await self.handle_cancel(sender, original_message_id)
             elif command == "/add":
                 await self.handle_add(sender["id"], arguments)
             elif command == "/delete":
                 if arguments:
                     await self.handle_delete(sender["id"], arguments[0])
+            elif command == "/from":
+                if arguments:
+                    await self.handle_from(sender["id"], original_message_id, arguments[0])
             elif command == "/go":
-                if len(arguments) == 1:
-                    await self.handle_go_from(sender["id"], arguments[0])
-                elif len(arguments) == 2:
-                    await self.handle_go_from_to(sender["id"], arguments[0], arguments[1])
+                if len(arguments) == 2:
+                    departure_code, destination_code = arguments
+                    await self.handle_go(sender["id"], original_message_id, departure_code, destination_code)
+                elif len(arguments) == 4:
+                    departure_code, destination_code, direction, timestamp = arguments
+                    await self.handle_go(
+                        sender["id"],
+                        original_message_id,
+                        departure_code,
+                        destination_code,
+                        direction == "<",
+                        int(timestamp),
+                    )
             elif command == "/departures":
                 if len(arguments) == 1:
-                    await self.handle_departures(sender["id"], arguments[0])
+                    await self.handle_departures(sender["id"], original_message_id, arguments[0])
+                elif len(arguments) == 3:
+                    station_code, direction, timestamp = arguments
+                    await self.handle_departures(sender["id"], original_message_id, station_code, direction == "<", int(timestamp))
         elif text:
             await self.handle_search_query(sender, text)
         elif location:
@@ -629,13 +680,14 @@ class Bot:
             self.botan.track(sender["id"], "Start"),
         )
 
-    async def handle_cancel(self, sender: dict):
+    async def handle_cancel(self, sender: dict, original_message_id: typing.Optional[int]):
         """
         Handles /cancel command.
         """
         await asyncio.gather(
-            self.telegram.send_message(
+            self.safe_edit_message(
                 sender["id"],
+                original_message_id,
                 Responses.DEFAULT.format(sender=sender),
                 parse_mode=ParseMode.markdown,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
@@ -676,121 +728,143 @@ class Bot:
             self.botan.track(user_id, "Delete", station_code=station_code),
         )
 
-    async def handle_go_from(self, user_id: int, departure_code: str):
+    async def handle_from(self, user_id: int, original_message_id: typing.Optional[int], departure_code: str):
         """
-        Handles /go command with one argument provided.
+        Handles /from <departure_code> command.
         """
-        buttons = await self.get_go_buttons_from(user_id, departure_code)
+        buttons = await self.get_from_buttons(user_id, departure_code)
         buttons.append([
             {"text": "Delete station", "callback_data": "/delete %s" % departure_code},
             {"text": "Departures", "callback_data": "/departures %s" % departure_code},
             self.BUTTON_CANCEL,
         ])
         await asyncio.gather(
-            self.telegram.send_message(
+            self.safe_edit_message(
                 user_id,
+                original_message_id,
                 Responses.SELECT_DESTINATION,
                 reply_markup=json.dumps({"inline_keyboard": buttons}),
             ),
             self.botan.track(user_id, "From", station_code=departure_code),
         )
 
-    async def handle_go_from_to(self, user_id: int, departure_code: str, destination_code: str):
+    async def handle_go(
+        self,
+        user_id: int,
+        original_message_id: typing.Optional[int],
+        departure_code: str,
+        destination_code: str,
+        navigate_backwards=False,
+        timestamp=None,
+    ):
         """
-        Handles /go command with two arguments provided.
+        Handles /go <departure_code> <destination_code> [<direction>] [<timestamp>] command.
         """
-        journeys = await self.db.get_journeys(departure_code, destination_code)
-        if journeys is None:
-            logging.debug("Journeys from %s to %s are not cached.", departure_code, destination_code)
-            journeys = await self.ns.plan_journey(departure_code, destination_code)
-            # Sometimes NS API returns too old journeys.
-            now = datetime.datetime.now()
-            journeys = [journey for journey in journeys if journey.actual_departure_time >= now]
-            await self.db.set_journeys(departure_code, destination_code, journeys)
-        journeys = journeys[:self.JOURNEY_COUNT]
+        timestamp = timestamp or int(time.time())
+        sub_key = "journeys:%s:%s" % (departure_code, destination_code)
 
-        departure_name = self.stations.code_station[departure_code].long_name
-        destination_name = self.stations.code_station[destination_code].long_name
-
-        journeys_text = "\n\n".join(
-            Responses.JOURNEY.format(
-                journey=journey,
-                duration=(journey.actual_duration or journey.planned_duration),
-                components_text="\n\n".join(
-                    Responses.COMPONENT.format(
-                        i=i,
-                        component=component,
-                        first_stop=component.stops[0],
-                        first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else ""),
-                        last_stop=component.stops[-1],
-                        last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else ""),
-                    )
-                    for i, component in enumerate(journey.components, start=1)
-                ),
-            ) for journey in journeys
+        await self.ensure_cache(
+            sub_key,
+            lambda: self.ns.plan_journey(departure_code, destination_code),
+            lambda _journey: int(_journey.actual_departure_time.timestamp()),
         )
-        if journeys_text:
-            text = Responses.JOURNEYS.format(departure_name=departure_name, destination_name=destination_name, journeys_text=journeys_text)
+        if navigate_backwards:
+            journey = await self.db.get_previous_from_cache(sub_key, timestamp)
         else:
-            text = Responses.NO_JOURNEYS.format(departure_name=departure_name, destination_name=destination_name)
+            journey = await self.db.get_next_from_cache(sub_key, timestamp)
 
-        await asyncio.gather(
-            self.telegram.send_message(
-                user_id,
-                text,
-                parse_mode=ParseMode.markdown,
-                reply_markup=json.dumps({
-                    "inline_keyboard": [[
-                        self.BUTTON_BACK,
-                        {"text": "Refresh", "callback_data": "/go %s %s" % (departure_code, destination_code)},
-                    ]],
-                }),
+        if journey is None:
+            logging.debug("No journey found.")
+            return
+
+        # TODO: departure_name = self.stations.code_station[departure_code].long_name
+        # TODO: destination_name = self.stations.code_station[destination_code].long_name
+
+        text = Responses.JOURNEY.format(
+            journey=journey,
+            duration=(journey.actual_duration or journey.planned_duration),
+            components_text="\n\n".join(
+                Responses.COMPONENT.format(
+                    i=i,
+                    component=component,
+                    first_stop=component.stops[0],
+                    first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else ""),
+                    last_stop=component.stops[-1],
+                    last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else ""),
+                )
+                for i, component in enumerate(journey.components, start=1)
             ),
+        )
+
+        navigate_arguments = (departure_code, destination_code, int(journey.actual_departure_time.timestamp()))
+        reply_markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {"text": "« Previous", "callback_data": "/go %s %s < %s" % navigate_arguments},
+                    {"text": "Now", "callback_data": "/go %s %s" % (departure_code, destination_code)},
+                    {"text": "Next »", "callback_data": "/go %s %s > %s" % navigate_arguments},
+                ],
+                [self.BUTTON_CANCEL],
+            ],
+        })
+        await asyncio.gather(
+            self.safe_edit_message(
+                user_id, original_message_id, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(
-                user_id,
-                "Plan",
+                user_id, "Go",
                 departure_code=departure_code,
                 destination_code=destination_code,
                 route=("%s-%s" % (departure_code, destination_code)),
             ),
         )
 
-    async def handle_departures(self, user_id: int, station_code: str):
+    async def handle_departures(
+        self,
+        user_id: int,
+        original_message_id:
+        typing.Optional[int],
+        station_code: str,
+        navigate_backwards=False,
+        timestamp=None,
+    ):
         """
-        Handles /departure command.
+        Handles /departure <station_code> [<direction>] [<timestamp>] command.
         """
-        departures = await self.db.get_departures(station_code)
-        if departures is None:
-            logging.debug("Departures from %s are not cached.", station_code)
-            departures = await self.ns.departures(station_code)
-            now = datetime.datetime.now()
-            # Sometimes NS API returns too old departures.
-            departures = [departure for departure in departures if departure.time >= now]
-            await self.db.set_departures(station_code, departures)
-        departures = departures[:self.DEPARTURE_COUNT]
+        timestamp = timestamp or int(time.time())
+        sub_key = "departures:%s" % station_code
 
-        departures_text = "\n\n".join(
-            Responses.DEPARTURE.format(
-                departure=departure,
-                platform_changed=(" %s" % Emoji.WARNING_SIGN if departure.is_platform_changed else " "),
-            ).rstrip()
-            for departure in departures
-        )
-        station_name = self.stations.code_station[station_code].long_name
-        text = (
-            Responses.DEPARTURES.format(station_name=station_name, departures_text=departures_text) if departures
-            else Responses.NO_DEPARTURES.format(station_name=station_name)
-        )
+        await self.ensure_cache(
+            sub_key, lambda: self.ns.departures(station_code), lambda _departure: int(_departure.time.timestamp()))
+        if navigate_backwards:
+            departure = await self.db.get_previous_from_cache(sub_key, timestamp)
+        else:
+            departure = await self.db.get_next_from_cache(sub_key, timestamp)
 
+        if departure is None:
+            logging.debug("No departures found.")
+            return
+
+        # TODO: station_name = self.stations.code_station[station_code].long_name
+
+        text = Responses.DEPARTURE.format(
+            departure=departure,
+            platform_changed=(" %s" % Emoji.WARNING_SIGN if departure.is_platform_changed else " "),
+        ).rstrip()
+
+        navigate_arguments = (station_code, int(departure.time.timestamp()))
+        reply_markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {"text": "« Previous", "callback_data": "/departures %s < %s" % navigate_arguments},
+                    {"text": "Now", "callback_data": "/departures %s" % station_code},
+                    {"text": "Next »", "callback_data": "/departures %s > %s" % navigate_arguments},
+                ],
+                [self.BUTTON_CANCEL],
+            ],
+        })
         await asyncio.gather(
-            self.telegram.send_message(
-                user_id,
-                text,
-                parse_mode=ParseMode.markdown,
-                reply_markup=json.dumps({"inline_keyboard": [
-                    [self.BUTTON_BACK, {"text": "Refresh", "callback_data": "/departures %s" % station_code}],
-                ]})
-            ),
+            self.safe_edit_message(
+                user_id, original_message_id, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(user_id, "Departures", station_code=station_code),
         )
 
@@ -806,7 +880,7 @@ class Bot:
                 Responses.LOCATION_FOUND.format(station_name=station.long_name),
                 parse_mode=ParseMode.markdown,
             ),
-            self.get_go_buttons_from(user_id, departure_code),
+            self.get_from_buttons(user_id, departure_code),
         )
         buttons.extend([
             [
@@ -854,7 +928,10 @@ class Bot:
             self.botan.track(sender["id"], "Query", query=text),
         )
 
-    async def get_go_buttons_from(self, user_id: int, departure_code: str) -> typing.List[typing.List[dict]]:
+    async def get_from_buttons(self, user_id: int, departure_code: str) -> typing.List[typing.List[dict]]:
+        """
+        Gets keyboard buttons that are displayed when the user is going from the specified station.
+        """
         station_codes = await self.db.get_favorites_stations(user_id)
         return [
             [{
@@ -864,6 +941,34 @@ class Bot:
             for destination_code in station_codes
             if destination_code != departure_code
         ]
+
+    async def ensure_cache(self, sub_key: str, get, score):
+        """
+        Ensures that the data under the specified key is cached.
+        Requests the data and puts into the cache otherwise.
+        """
+        if not await self.db.is_cached(sub_key):
+            logging.debug("Caching items for %s…", sub_key)
+            await self.db.put_into_cache(sub_key, await get(), score)
+
+    async def safe_edit_message(
+        self,
+        chat_id: typing.Union[None, int, str],
+        message_id: typing.Optional[int],
+        text: str,
+        parse_mode=ParseMode.default,
+        disable_web_page_preview=False,
+        reply_markup=None,
+    ):
+        """
+        Edit the existing message if any or sends a new one otherwise.
+        """
+        if message_id:
+            return await self.telegram.edit_message_text(
+                chat_id, message_id, None, text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
+        else:
+            return await self.telegram.send_message(
+                chat_id, text, parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
 
 
 # Utilities.
