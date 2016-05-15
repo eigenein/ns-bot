@@ -594,7 +594,11 @@ class Bot:
                 sender = update["callback_query"]["from"]
                 text = update["callback_query"]["data"]
                 location = None
-                original_message_id = update["callback_query"].get("message", {}).get("message_id")
+                # We're not able to edit a non-text message.
+                if "message" in update["callback_query"] and update["callback_query"]["message"].get("text"):
+                    original_message_id = update["callback_query"]["message"]["message_id"]
+                else:
+                    original_message_id = None
             else:
                 continue
             if not text and not location:
