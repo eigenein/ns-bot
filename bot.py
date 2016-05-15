@@ -319,8 +319,10 @@ class Telegram:
             if payload["ok"]:
                 logging.debug("%s → %s", method, payload)
                 return payload["result"]
+            elif payload["description"] == "Bad Request: message is not modified":
+                logging.warning("%s → %s", method, payload)
+                return
             else:
-                # TODO: handle: {'ok': False, 'description': 'Bad Request: message is not modified', 'error_code': 400}
                 logging.error("%s → %s", method, payload)
                 raise TelegramException(payload["description"])
 
