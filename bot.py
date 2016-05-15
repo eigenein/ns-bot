@@ -116,9 +116,13 @@ class Responses:
         " on *{{last_stop.name}}*."
     ).format(emoji=Emoji)
 
+    ADDED = (
+        "*{}* station is added to your favorites! Now you can use it as either departure or destination."
+        " Add as many stations as you would like to use."
+    )
+
+    DELETED = "*{}* station is deleted from your favorites. You can always add it back later."
     DEFAULT = "*Hi {sender[first_name]}!* Tap a departure station to plan a journey."
-    ADDED = "It’s added! Now you can use it as either departure or destination. Add as many stations as you would like to use."
-    DELETED = "It’s deleted. You can always add it back later."
     SEARCH = "Just send me a station name. You can do that whenever you want."
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
@@ -316,6 +320,7 @@ class Telegram:
                 logging.debug("%s → %s", method, payload)
                 return payload["result"]
             else:
+                # TODO: handle: {'ok': False, 'description': 'Bad Request: message is not modified', 'error_code': 400}
                 logging.error("%s → %s", method, payload)
                 raise TelegramException(payload["description"])
 
@@ -613,9 +618,12 @@ class Bot:
                 raise
 
     async def get_default_keyboard(self, user_id: int) -> str:
+        """
+        Gets keyboard to choose from user's favorite stations.
+        """
         station_codes = await self.db.get_favorites_stations(user_id)
         buttons = [
-            [{"text": self.stations.code_station[station_code].long_name, "callback_data": "/from %s" % station_code}]
+            [{"text": self.get_station_name(station_code), "callback_data": "/from %s" % station_code}]
             for station_code in station_codes
         ]
         buttons.extend([[self.BUTTON_SEARCH, self.BUTTON_FEEDBACK]])
@@ -634,10 +642,11 @@ class Bot:
             elif command == "/cancel":
                 await self.handle_cancel(sender, original_message_id)
             elif command == "/add":
-                await self.handle_add(sender["id"], arguments)
+                if arguments:
+                    await self.handle_add(sender["id"], original_message_id, arguments[0])
             elif command == "/delete":
                 if arguments:
-                    await self.handle_delete(sender["id"], arguments[0])
+                    await self.handle_delete(sender["id"], original_message_id, arguments[0])
             elif command == "/from":
                 if arguments:
                     await self.handle_from(sender["id"], original_message_id, arguments[0])
@@ -705,26 +714,37 @@ class Bot:
             self.botan.track(user_id, "Search"),
         )
 
-    async def handle_add(self, user_id: int, station_codes: typing.Iterable[str]):
+    async def handle_add(self, user_id: int, original_message_id: typing.Optional[int], station_code: str):
         """
-        Handles /add command.
+        Handles /add <station_code> command.
         """
-        for station_code in station_codes:
-            await self.db.add_favorite_station(user_id, station_code)
+        await self.db.add_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
         await asyncio.gather(
-            self.telegram.send_message(user_id, Responses.ADDED, reply_markup=reply_markup),
-            *(self.botan.track(user_id, "Add", station_code=station_code) for station_code in station_codes),
+            self.safe_edit_message(
+                user_id,
+                original_message_id,
+                Responses.ADDED.format(self.get_station_name(station_code)),
+                parse_mode=ParseMode.markdown,
+                reply_markup=reply_markup,
+            ),
+            self.botan.track(user_id, "Add", station_code=station_code),
         )
 
-    async def handle_delete(self, user_id: int, station_code: str):
+    async def handle_delete(self, user_id: int, original_message_id: typing.Optional[int], station_code: str):
         """
-        Handles /delete command.
+        Handles /delete <station_code> command.
         """
         await self.db.delete_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
         await asyncio.gather(
-            self.telegram.send_message(user_id, Responses.DELETED, reply_markup=reply_markup),
+            self.safe_edit_message(
+                user_id,
+                original_message_id,
+                Responses.DELETED.format(self.get_station_name(station_code)),
+                parse_mode=ParseMode.markdown,
+                reply_markup=reply_markup,
+            ),
             self.botan.track(user_id, "Delete", station_code=station_code),
         )
 
@@ -774,11 +794,8 @@ class Bot:
             journey = await self.db.get_next_from_cache(sub_key, timestamp)
 
         if journey is None:
-            logging.debug("No journey found.")
+            logging.debug("No journeys found.")
             return
-
-        # TODO: departure_name = self.stations.code_station[departure_code].long_name
-        # TODO: destination_name = self.stations.code_station[destination_code].long_name
 
         text = Responses.JOURNEY.format(
             journey=journey,
@@ -843,8 +860,6 @@ class Bot:
         if departure is None:
             logging.debug("No departures found.")
             return
-
-        # TODO: station_name = self.stations.code_station[station_code].long_name
 
         text = Responses.DEPARTURE.format(
             departure=departure,
@@ -935,7 +950,7 @@ class Bot:
         station_codes = await self.db.get_favorites_stations(user_id)
         return [
             [{
-                "text": "Go to %s" % self.stations.code_station[destination_code].long_name,
+                "text": "Go to %s" % self.get_station_name(destination_code),
                 "callback_data": "/go %s %s" % (departure_code, destination_code),
             }]
             for destination_code in station_codes
@@ -969,6 +984,12 @@ class Bot:
         else:
             return await self.telegram.send_message(
                 chat_id, text, parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
+
+    def get_station_name(self, station_code: str):
+        """
+        Gets station name by the station code.
+        """
+        return self.stations.code_station[station_code].long_name
 
 
 # Utilities.
