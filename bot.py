@@ -530,16 +530,10 @@ class StationIndex:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Bot:
-    LIMIT = 100
-    TIMEOUT = 60
-
-    JOURNEY_COUNT = 2
-    DEPARTURE_COUNT = 5
+    TELEGRAM_LIMIT = 100
+    TELEGRAM_TIMEOUT = 60
 
     BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
-    BUTTON_SEARCH = {"text": "Search Station", "callback_data": "/search"}
-    BUTTON_FEEDBACK = {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"}
-    BUTTON_BACK = {"text": "Back", "callback_data": "/cancel"}
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -584,7 +578,7 @@ class Bot:
         """
         Executes one message loop iteration. Gets Telegram updates and handles them.
         """
-        updates = await self.telegram.get_updates(self.offset, self.LIMIT, self.TIMEOUT)
+        updates = await self.telegram.get_updates(self.offset, self.TELEGRAM_LIMIT, self.TELEGRAM_TIMEOUT)
         for update in updates:
             logging.info("Got update #%s.", update["update_id"])
             self.offset = update["update_id"] + 1
@@ -626,7 +620,10 @@ class Bot:
             [{"text": self.get_station_name(station_code), "callback_data": "/from %s" % station_code}]
             for station_code in station_codes
         ]
-        buttons.extend([[self.BUTTON_SEARCH, self.BUTTON_FEEDBACK]])
+        buttons.extend([[
+            {"text": "Search Station", "callback_data": "/search"},
+            {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"},
+        ]])
         return json.dumps({"inline_keyboard": buttons})
 
     async def handle_message(self, sender: dict, original_message_id: typing.Optional[int], text: str, location: dict):
