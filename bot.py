@@ -589,22 +589,18 @@ class Bot:
                 sender = update["message"]["from"]
                 text = update["message"].get("text")
                 location = update["message"].get("location")
-                original_message_id = None
+                original_message = None
             elif "callback_query" in update:
                 sender = update["callback_query"]["from"]
                 text = update["callback_query"]["data"]
                 location = None
-                # We're not able to edit a non-text message.
-                if "message" in update["callback_query"] and update["callback_query"]["message"].get("text"):
-                    original_message_id = update["callback_query"]["message"]["message_id"]
-                else:
-                    original_message_id = None
+                original_message = update["callback_query"].get("message")
             else:
                 continue
             if not text and not location:
                 continue
             try:
-                future = self.handle_message(sender, original_message_id, text, location)
+                future = self.handle_message(sender, original_message, text, location)
                 if "callback_query" in update:
                     await asyncio.gather(future, self.telegram.answer_callback_query(update["callback_query"]["id"]))
                 else:
@@ -632,7 +628,7 @@ class Bot:
         ]])
         return json.dumps({"inline_keyboard": buttons})
 
-    async def handle_message(self, sender: dict, original_message_id: typing.Optional[int], text: str, location: dict):
+    async def handle_message(self, sender: dict, original_message: typing.Optional[dict], text: str, location: dict):
         """
         Handle single message from a user.
         """
@@ -643,25 +639,25 @@ class Bot:
             elif command == "/search":
                 await self.handle_search(sender["id"])
             elif command == "/cancel":
-                await self.handle_cancel(sender, original_message_id)
+                await self.handle_cancel(sender, original_message)
             elif command == "/add":
                 if arguments:
-                    await self.handle_add(sender["id"], original_message_id, arguments[0])
+                    await self.handle_add(sender["id"], original_message, arguments[0])
             elif command == "/delete":
                 if arguments:
-                    await self.handle_delete(sender["id"], original_message_id, arguments[0])
+                    await self.handle_delete(sender["id"], original_message, arguments[0])
             elif command == "/from":
                 if arguments:
-                    await self.handle_from(sender["id"], original_message_id, arguments[0])
+                    await self.handle_from(sender["id"], original_message, arguments[0])
             elif command == "/go":
                 if len(arguments) == 2:
                     departure_code, destination_code = arguments
-                    await self.handle_go(sender["id"], original_message_id, departure_code, destination_code)
+                    await self.handle_go(sender["id"], original_message, departure_code, destination_code)
                 elif len(arguments) == 4:
                     departure_code, destination_code, direction, timestamp = arguments
                     await self.handle_go(
                         sender["id"],
-                        original_message_id,
+                        original_message,
                         departure_code,
                         destination_code,
                         direction == "<",
@@ -669,10 +665,10 @@ class Bot:
                     )
             elif command == "/departures":
                 if len(arguments) == 1:
-                    await self.handle_departures(sender["id"], original_message_id, arguments[0])
+                    await self.handle_departures(sender["id"], original_message, arguments[0])
                 elif len(arguments) == 3:
                     station_code, direction, timestamp = arguments
-                    await self.handle_departures(sender["id"], original_message_id, station_code, direction == "<", int(timestamp))
+                    await self.handle_departures(sender["id"], original_message, station_code, direction == "<", int(timestamp))
         elif text:
             await self.handle_search_query(sender, text)
         elif location:
@@ -692,14 +688,14 @@ class Bot:
             self.botan.track(sender["id"], "Start"),
         )
 
-    async def handle_cancel(self, sender: dict, original_message_id: typing.Optional[int]):
+    async def handle_cancel(self, sender: dict, original_message: dict):
         """
         Handles /cancel command.
         """
         await asyncio.gather(
             self.safe_edit_message(
                 sender["id"],
-                original_message_id,
+                original_message,
                 Responses.DEFAULT.format(sender=sender),
                 parse_mode=ParseMode.markdown,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
@@ -717,7 +713,7 @@ class Bot:
             self.botan.track(user_id, "Search"),
         )
 
-    async def handle_add(self, user_id: int, original_message_id: typing.Optional[int], station_code: str):
+    async def handle_add(self, user_id: int, original_message: typing.Optional[dict], station_code: str):
         """
         Handles /add <station_code> command.
         """
@@ -726,7 +722,7 @@ class Bot:
         await asyncio.gather(
             self.safe_edit_message(
                 user_id,
-                original_message_id,
+                original_message,
                 Responses.ADDED.format(self.get_station_name(station_code)),
                 parse_mode=ParseMode.markdown,
                 reply_markup=reply_markup,
@@ -734,7 +730,7 @@ class Bot:
             self.botan.track(user_id, "Add", station_code=station_code),
         )
 
-    async def handle_delete(self, user_id: int, original_message_id: typing.Optional[int], station_code: str):
+    async def handle_delete(self, user_id: int, original_message: typing.Optional[dict], station_code: str):
         """
         Handles /delete <station_code> command.
         """
@@ -743,7 +739,7 @@ class Bot:
         await asyncio.gather(
             self.safe_edit_message(
                 user_id,
-                original_message_id,
+                original_message,
                 Responses.DELETED.format(self.get_station_name(station_code)),
                 parse_mode=ParseMode.markdown,
                 reply_markup=reply_markup,
@@ -751,7 +747,7 @@ class Bot:
             self.botan.track(user_id, "Delete", station_code=station_code),
         )
 
-    async def handle_from(self, user_id: int, original_message_id: typing.Optional[int], departure_code: str):
+    async def handle_from(self, user_id: int, original_message: typing.Optional[dict], departure_code: str):
         """
         Handles /from <departure_code> command.
         """
@@ -764,7 +760,7 @@ class Bot:
         await asyncio.gather(
             self.safe_edit_message(
                 user_id,
-                original_message_id,
+                original_message,
                 Responses.SELECT_DESTINATION,
                 reply_markup=json.dumps({"inline_keyboard": buttons}),
             ),
@@ -774,7 +770,7 @@ class Bot:
     async def handle_go(
         self,
         user_id: int,
-        original_message_id: typing.Optional[int],
+        original_message: typing.Optional[dict],
         departure_code: str,
         destination_code: str,
         navigate_backwards=False,
@@ -829,7 +825,7 @@ class Bot:
         })
         await asyncio.gather(
             self.safe_edit_message(
-                user_id, original_message_id, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
+                user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(
                 user_id, "Go",
                 departure_code=departure_code,
@@ -841,8 +837,7 @@ class Bot:
     async def handle_departures(
         self,
         user_id: int,
-        original_message_id:
-        typing.Optional[int],
+        original_message: typing.Optional[dict],
         station_code: str,
         navigate_backwards=False,
         timestamp=None,
@@ -882,7 +877,7 @@ class Bot:
         })
         await asyncio.gather(
             self.safe_edit_message(
-                user_id, original_message_id, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
+                user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(user_id, "Departures", station_code=station_code),
         )
 
@@ -972,18 +967,18 @@ class Bot:
     async def safe_edit_message(
         self,
         chat_id: typing.Union[None, int, str],
-        message_id: typing.Optional[int],
+        message: typing.Optional[dict],
         text: str,
         parse_mode=ParseMode.default,
         disable_web_page_preview=False,
         reply_markup=None,
     ):
         """
-        Edit the existing message if any or sends a new one otherwise.
+        Edit the existing text message if any or sends a new one otherwise.
         """
-        if message_id:
+        if message and "text" in message:
             return await self.telegram.edit_message_text(
-                chat_id, message_id, None, text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
+                chat_id, message["message_id"], None, text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
         else:
             return await self.telegram.send_message(
                 chat_id, text, parse_mode, disable_web_page_preview=disable_web_page_preview, reply_markup=reply_markup)
