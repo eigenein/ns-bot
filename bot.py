@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import pickle
+import sys
 import time
 import typing
 
@@ -34,7 +35,12 @@ import aiohttp
 import aioredis
 import click
 
-import config
+try:
+    # noinspection PyUnresolvedReferences
+    import config
+except ImportError:
+    print("Configuration module is not found.", file=sys.stderr)
+    sys.exit(1)
 
 
 # CLI Commands.
@@ -100,13 +106,6 @@ class Responses:
         "\N{ALARM CLOCK} *{first_stop.time:%-H:%M}* \N{STATION} *{first_stop.platform}*"
         " → \N{ALARM CLOCK} *{last_stop.time:%-H:%M}* \N{STATION} *{last_stop.platform}*",
     ))
-
-    COMPONENT2 = (
-        "\N{TRAIN} _{component.transport_type}_ will depart at *{first_stop.time:%-H:%M}* from platform"
-        " *{first_stop.platform}* on *{first_stop.name}*"
-        " and arrive at *{last_stop.time:%-H:%M}* to platform *{last_stop.platform}*"
-        " on *{last_stop.name}*."
-    )
 
     ADDED = (
         "*{}* station is added to your favorites! Now you can use it as either departure or destination."
