@@ -46,7 +46,7 @@ import config
 def main(log_file: click.File, verbose: bool):
     logging.basicConfig(
         datefmt="%Y-%m-%d %H:%M:%S",
-        format="%(asctime)s (%(module)s) [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname).1s] %(message)s",
         level=(logging.INFO if not verbose else logging.DEBUG),
         stream=(log_file or click.get_text_stream("stderr")),
     )
@@ -64,57 +64,42 @@ def main(log_file: click.File, verbose: bool):
             bot.stop()
 
 
-# Emoji.
-# ----------------------------------------------------------------------------------------------------------------------
-
-class Emoji:
-    ALARM_CLOCK = chr(0x23F0)
-    BLACK_SUN_WITH_RAYS = chr(0x2600)
-    PENSIVE_FACE = chr(0x1F614)
-    STATION = chr(0x1F689)
-    TRAIN = chr(0x1F686)
-    TWISTED_RIGHTWARDS_ARROWS = chr(0x1F500)
-    UPWARDS_BLACK_ARROW = chr(0x2B06)
-    WARNING_SIGN = chr(0x26A0)
-    WHITE_QUESTION_MARK_ORNAMENT = chr(0x2754)
-
-
 # Bot response phrases.
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Responses:
     START = "\n".join((
-        "*Hi {{sender[first_name]}}!* {emoji.BLACK_SUN_WITH_RAYS}",
+        "*Hi {sender[first_name]}!* \N{BLACK SUN WITH RAYS}",
         "",
         "You can add your favorite station simply by sending me its name. Small typos are okay.",
         "",
         "You can also send me your location to see departures from the nearest station.",
-    )).format(emoji=Emoji)
+    ))
 
     ERROR = "\n".join((
-        "I’m experiencing some technical problems, sorry. {emoji.PENSIVE_FACE}",
+        "I’m experiencing some technical problems, sorry. \N{PENSIVE FACE}",
         "",
         "Maybe try again later.",
-    )).format(emoji=Emoji)
+    ))
 
     DEPARTURE = "\n".join((
-        "*{{departure.destination}}*",
-        "{emoji.ALARM_CLOCK} *{{departure.time:%-H:%M}}* _{{departure.delay_text}}_ {emoji.STATION} *{{departure.platform}}{{platform_changed}}*",
-        "{emoji.TRAIN} {{departure.train_type}} _{{departure.route_text}}_",
-    )).format(emoji=Emoji)
+        "*{departure.destination}*",
+        "\N{ALARM CLOCK} *{departure.time:%-H:%M}* _{departure.delay_text}_ \N{STATION} *{departure.platform}{platform_changed}*",
+        "\N{TRAIN} {departure.train_type} _{departure.route_text}_",
+    ))
 
     JOURNEY = "\n".join((
-        "{emoji.ALARM_CLOCK} *{{journey.actual_departure_time:%-H:%M}}* → _{{duration}}_ → *{{journey.actual_arrival_time:%-H:%M}}*",
+        "\N{ALARM CLOCK} *{journey.actual_departure_time:%-H:%M}* → _{duration}_ → *{journey.actual_arrival_time:%-H:%M}*",
         "",
-        "{{components_text}}",
-    )).format(emoji=Emoji)
+        "{components_text}",
+    ))
 
     COMPONENT = (
-        "{{i}}. {emoji.TRAIN} _{{component.transport_type}}_ will depart at *{{first_stop.time:%-H:%M}}* from platform"
-        " *{{first_stop.platform}}*{{first_stop_warning}} on *{{first_stop.name}}*"
-        " and arrive at *{{last_stop.time:%-H:%M}}* to platform *{{last_stop.platform}}*{{last_stop_warning}}"
-        " on *{{last_stop.name}}*."
-    ).format(emoji=Emoji)
+        "{i}. \N{TRAIN} _{component.transport_type}_ will depart at *{first_stop.time:%-H:%M}* from platform"
+        " *{first_stop.platform}*{first_stop_warning} on *{first_stop.name}*"
+        " and arrive at *{last_stop.time:%-H:%M}* to platform *{last_stop.platform}*{last_stop_warning}"
+        " on *{last_stop.name}*."
+    )
 
     ADDED = (
         "*{}* station is added to your favorites! Now you can use it as either departure or destination."
@@ -503,15 +488,8 @@ class Ns:
 
 class StationIndex:
     def __init__(self, stations: typing.Iterable[Station]):
-        self.code_station = {
-            station.code: station
-            for station in stations
-        }  # type: typing.Dict[str, Station]
-        self.name_station = {
-            name.lower(): station
-            for station in stations
-            for name in station.names
-        }  # type: typing.Dict[str, Station]
+        self.code_station = {station.code: station for station in stations}
+        self.name_station = {name.lower(): station for station in stations for name in station.names}
         self.names = list(self.name_station)
 
     def search(self, query: str) -> typing.List[Station]:
@@ -804,9 +782,9 @@ class Bot:
                     i=i,
                     component=component,
                     first_stop=component.stops[0],
-                    first_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[0].is_platform_changed else ""),
+                    first_stop_warning=(" \N{WARNING SIGN}" if component.stops[0].is_platform_changed else ""),
                     last_stop=component.stops[-1],
-                    last_stop_warning=(" %s" % Emoji.WARNING_SIGN if component.stops[-1].is_platform_changed else ""),
+                    last_stop_warning=(" \N{WARNING SIGN}" if component.stops[-1].is_platform_changed else ""),
                 )
                 for i, component in enumerate(journey.components, start=1)
             ),
@@ -861,7 +839,7 @@ class Bot:
 
         text = Responses.DEPARTURE.format(
             departure=departure,
-            platform_changed=(" %s" % Emoji.WARNING_SIGN if departure.is_platform_changed else " "),
+            platform_changed=(" \N{WARNING SIGN}" if departure.is_platform_changed else " "),
         ).rstrip()
 
         navigate_arguments = (station_code, int(departure.time.timestamp()))
