@@ -84,7 +84,7 @@ class Responses:
 
     DEPARTURE = "\n".join((
         "*{departure.destination}*",
-        "\N{ALARM CLOCK} *{departure.time:%-H:%M}* _{departure.delay_text}_ \N{STATION} *{departure.platform}{platform_changed}*",
+        "\N{ALARM CLOCK} *{departure.time:%-H:%M}* _{departure.delay_text}_ \N{STATION} *{departure.platform}*",
         "\N{TRAIN} {departure.train_type} _{departure.route_text}_",
     ))
 
@@ -94,10 +94,17 @@ class Responses:
         "{components_text}",
     ))
 
-    COMPONENT = (
-        "{i}. \N{TRAIN} _{component.transport_type}_ will depart at *{first_stop.time:%-H:%M}* from platform"
-        " *{first_stop.platform}*{first_stop_warning} on *{first_stop.name}*"
-        " and arrive at *{last_stop.time:%-H:%M}* to platform *{last_stop.platform}*{last_stop_warning}"
+    COMPONENT = "\n".join((
+        "\N{TRAIN} _{component.transport_type}_",
+        "*{first_stop.name}* → *{last_stop.name}*",
+        "\N{ALARM CLOCK} *{first_stop.time:%-H:%M}* \N{STATION} *{first_stop.platform}*"
+        " → \N{ALARM CLOCK} *{last_stop.time:%-H:%M}* \N{STATION} *{last_stop.platform}*",
+    ))
+
+    COMPONENT2 = (
+        "\N{TRAIN} _{component.transport_type}_ will depart at *{first_stop.time:%-H:%M}* from platform"
+        " *{first_stop.platform}* on *{first_stop.name}*"
+        " and arrive at *{last_stop.time:%-H:%M}* to platform *{last_stop.platform}*"
         " on *{last_stop.name}*."
     )
 
@@ -765,14 +772,11 @@ class Bot:
             duration=(journey.actual_duration or journey.planned_duration),
             components_text="\n\n".join(
                 Responses.COMPONENT.format(
-                    i=i,
                     component=component,
                     first_stop=component.stops[0],
-                    first_stop_warning=(" \N{WARNING SIGN}" if component.stops[0].is_platform_changed else ""),
                     last_stop=component.stops[-1],
-                    last_stop_warning=(" \N{WARNING SIGN}" if component.stops[-1].is_platform_changed else ""),
                 )
-                for i, component in enumerate(journey.components, start=1)
+                for component in journey.components
             ),
         )
 
@@ -823,10 +827,7 @@ class Bot:
             logging.debug("No departures found.")
             return
 
-        text = Responses.DEPARTURE.format(
-            departure=departure,
-            platform_changed=(" \N{WARNING SIGN}" if departure.is_platform_changed else " "),
-        ).rstrip()
+        text = Responses.DEPARTURE.format(departure=departure).rstrip()
 
         navigate_arguments = (station_code, int(departure.time.timestamp()))
         reply_markup = json.dumps({
