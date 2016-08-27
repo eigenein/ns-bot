@@ -107,8 +107,7 @@ class Responses:
     )
 
     DELETED = "*{}* station is deleted from your favorites. You can always add it back later."
-    DEFAULT = "*Hi {sender[first_name]}!* Tap a departure station to plan a journey."
-    SEARCH = "Just send me a station name. You can do that whenever you want."
+    DEFAULT = "*Hi {sender[first_name]}!* \N{BLACK SUN WITH RAYS} Tap a departure station to plan a journey or send me a station name."
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
     SELECT_DESTINATION = "Ok, where would you like to go?"
@@ -513,7 +512,7 @@ class Bot:
     TELEGRAM_LIMIT = 100
     TELEGRAM_TIMEOUT = 60
 
-    BUTTON_CANCEL = {"text": "Cancel", "callback_data": "/cancel"}
+    BUTTON_BACK = {"text": "Back", "callback_data": "/back"}
 
     TRANSLATE_TABLE = {
         ord("а"): "a", ord("б"): "b", ord("в"): "v", ord("г"): "g", ord("д"): "d", ord("е"): "e", ord("ж"): "zh",
@@ -601,7 +600,6 @@ class Bot:
             for station_code in station_codes
         ]
         buttons.extend([[
-            {"text": "Search Station", "callback_data": "/search"},
             {"text": "Bot Feedback", "url": "https://telegram.me/eigenein"},
         ]])
         return json.dumps({"inline_keyboard": buttons})
@@ -614,10 +612,8 @@ class Bot:
             command, *arguments = text.split()
             if command == "/start":
                 await self.handle_start(sender)
-            elif command == "/search":
-                await self.handle_search(sender["id"])
-            elif command == "/cancel":
-                await self.handle_cancel(sender, original_message)
+            elif command == "/back":
+                await self.handle_back(sender)
             elif command == "/add":
                 if arguments:
                     await self.handle_add(sender["id"], original_message, arguments[0])
@@ -666,29 +662,19 @@ class Bot:
             self.botan.track(sender["id"], "Start"),
         )
 
-    async def handle_cancel(self, sender: dict, original_message: dict):
+    async def handle_back(self, sender: dict):
         """
-        Handles /cancel command.
+        Handles /back command.
         """
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 sender["id"],
-                original_message,
+                None,
                 Responses.DEFAULT.format(sender=sender),
                 parse_mode=ParseMode.markdown,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
             ),
             self.botan.track(sender["id"], "Cancel"),
-        )
-
-    async def handle_search(self, user_id: int):
-        """
-        Handles /search command.
-        """
-        reply_markup = await self.get_default_keyboard(user_id)
-        await asyncio.gather(
-            self.telegram.send_message(user_id, Responses.SEARCH, reply_markup=reply_markup),
-            self.botan.track(user_id, "Search"),
         )
 
     async def handle_add(self, user_id: int, original_message: typing.Optional[dict], station_code: str):
@@ -698,7 +684,7 @@ class Bot:
         await self.db.add_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 user_id,
                 original_message,
                 Responses.ADDED.format(self.get_station_name(station_code)),
@@ -715,7 +701,7 @@ class Bot:
         await self.db.delete_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 user_id,
                 original_message,
                 Responses.DELETED.format(self.get_station_name(station_code)),
@@ -733,10 +719,10 @@ class Bot:
         buttons.append([
             {"text": "Delete station", "callback_data": "/delete %s" % departure_code},
             {"text": "Departures", "callback_data": "/departures %s" % departure_code},
-            self.BUTTON_CANCEL,
+            self.BUTTON_BACK,
         ])
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 user_id,
                 original_message,
                 Responses.SELECT_DESTINATION,
@@ -798,11 +784,11 @@ class Bot:
                     {"text": "Now", "callback_data": "/go %s %s" % (departure_code, destination_code)},
                     {"text": "Next »", "callback_data": "/go %s %s > %s" % navigate_arguments},
                 ],
-                [self.BUTTON_CANCEL],
+                [self.BUTTON_BACK],
             ],
         })
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(
                 user_id, "Go",
@@ -850,11 +836,11 @@ class Bot:
                     {"text": "Now", "callback_data": "/departures %s" % station_code},
                     {"text": "Next »", "callback_data": "/departures %s > %s" % navigate_arguments},
                 ],
-                [self.BUTTON_CANCEL],
+                [self.BUTTON_BACK],
             ],
         })
         await asyncio.gather(
-            self.safe_edit_message(
+            self.edit_message(
                 user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
             self.botan.track(user_id, "Departures", station_code=station_code),
         )
@@ -877,7 +863,7 @@ class Bot:
             [
                 {"text": "Add", "callback_data": "/add %s" % station.code},
                 {"text": "Departures", "callback_data": "/departures %s" % station.code},
-                self.BUTTON_CANCEL,
+                self.BUTTON_BACK,
             ],
         ])
         await asyncio.gather(
@@ -902,7 +888,7 @@ class Bot:
                 [{"text": station.long_name, "callback_data": "/add %s" % station.code}]
                 for station in stations
             ]
-            buttons.append([self.BUTTON_CANCEL])
+            buttons.append([self.BUTTON_BACK])
             future = self.telegram.send_message(
                 sender["id"],
                 Responses.SEARCH_RESULTS,
@@ -942,7 +928,7 @@ class Bot:
             logging.debug("Caching items for %s…", sub_key)
             await self.db.put_into_cache(sub_key, await get(), score)
 
-    async def safe_edit_message(
+    async def edit_message(
         self,
         chat_id: typing.Union[None, int, str],
         message: typing.Optional[dict],
