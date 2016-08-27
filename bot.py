@@ -464,7 +464,9 @@ class Ns:
                         ]
                     ) for component in journey.findall("ReisDeel")
                 ]
-            ) for journey in root
+            )
+            for journey in root
+            if self.element_text(journey.find("Status")) != "NIET-MOGELIJK"
         ]
 
     @staticmethod
@@ -477,7 +479,7 @@ class Ns:
         return datetime.datetime.strptime(time_string, "%Y-%m-%dT%H:%M:%S%z").replace(tzinfo=None)
 
     @staticmethod
-    def element_text(element):
+    def element_text(element) -> str:
         return element.text if element is not None else ""
 
     @staticmethod
