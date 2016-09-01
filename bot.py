@@ -634,7 +634,7 @@ class Bot:
             elif command == "/go":
                 if len(arguments) == 2:
                     departure_code, destination_code = arguments
-                    await self.handle_go(sender["id"], original_message, departure_code, destination_code)
+                    await self.handle_go(sender["id"], None, departure_code, destination_code)
                 elif len(arguments) == 4:
                     departure_code, destination_code, direction, timestamp = arguments
                     await self.handle_go(
