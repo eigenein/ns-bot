@@ -734,6 +734,7 @@ class Bot:
                 user_id,
                 original_message,
                 Responses.SELECT_DESTINATION.format(station_name=self.get_station_name(departure_code)),
+                parse_mode=ParseMode.markdown,
                 reply_markup=json.dumps({"inline_keyboard": buttons}),
             ),
             self.botan.track(user_id, "From", station_code=departure_code),
