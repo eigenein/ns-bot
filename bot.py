@@ -116,7 +116,7 @@ class Responses:
     DEFAULT = "*Hi {sender[first_name]}!* \N{BLACK SUN WITH RAYS} Tap a departure station to plan a journey or send me a station name."
     NO_SEARCH_RESULTS = "I couldn’t find any station with similar name. Please check it and try again."
     SEARCH_RESULTS = "I’ve found the following stations. Tap a station to add it to favorites."
-    SELECT_DESTINATION = "Ok, where would you like to go?"
+    SELECT_DESTINATION = "Ok, where would you like to go from *{station_name}*?"
     LOCATION_FOUND = "The nearest station is *{station_name}*. Where would you like to go from there?"
 
 
@@ -733,7 +733,7 @@ class Bot:
             self.edit_message(
                 user_id,
                 original_message,
-                Responses.SELECT_DESTINATION,
+                Responses.SELECT_DESTINATION.format(station_name=self.get_station_name(departure_code)),
                 reply_markup=json.dumps({"inline_keyboard": buttons}),
             ),
             self.botan.track(user_id, "From", station_code=departure_code),
