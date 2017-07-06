@@ -5,12 +5,6 @@
 What can this bot do?
 
 The bot can plan a journey with NS trains via their recommendations service.
-
-Configuration module should contain the following constants:
-TELEGRAM_TOKEN = "…"  # Telegram Bot API token
-BOTAN_TOKEN = "…"  # Botan.io token
-NS_LOGIN = "…"  # NS API login
-NS_PASSWORD = "…"  # NS API password
 """
 
 import asyncio
@@ -39,14 +33,12 @@ import click
 
 @click.command()
 @click.option("--telegram-token", help="Telegram Bot API token.", required=True, envvar="NS_BOT_TELEGRAM_TOKEN")
-@click.option("--botan-token", help="Botan.io API token.", required=True, envvar="NS_BOT_BOTAN_TOKEN")
 @click.option("--ns-login", help="NS API login.", required=True, envvar="NS_API_LOGIN")
 @click.option("--ns-password", help="NS API password.", required=True, envvar="NS_API_PASSWORD")
 @click.option("-l", "--log-file", type=click.File("at", encoding="utf-8"))
 @click.option("-v", "--verbose", type=bool, is_flag=True)
 def main(
     telegram_token: str,
-    botan_token: str,
     ns_login: str,
     ns_password: str,
     log_file: click.File,
@@ -62,9 +54,8 @@ def main(
     logging.info("Starting bot…")
     with ExitStack() as exit_stack:
         telegram = exit_stack.enter_context(closing(Telegram(telegram_token)))
-        botan = exit_stack.enter_context(closing(Botan(botan_token)))
         ns = exit_stack.enter_context(closing(Ns(ns_login, ns_password)))
-        bot = exit_stack.enter_context(closing(Bot(telegram, botan, ns)))
+        bot = exit_stack.enter_context(closing(Bot(telegram, ns)))
         try:
             asyncio.ensure_future(bot.run())
             asyncio.get_event_loop().run_forever()
@@ -328,43 +319,6 @@ class TelegramException(Exception):
         super().__init__(message)
 
 
-# Bot Analytics.
-# ----------------------------------------------------------------------------------------------------------------------
-
-class Botan:
-    """
-    Botan.io API.
-    """
-
-    HEADERS = {"Content-Type": "application/json"}
-
-    def __init__(self, token: str):
-        self.token = token
-        self.session = aiohttp.ClientSession()
-
-    async def track(self, uid: typing.Union[None, str, int], name: str, **kwargs):
-        """
-        Tracks event.
-        """
-        if not self.token:
-            return
-        try:
-            async with self.session.post(
-                "https://api.botan.io/track",
-                params={"token": self.token, "uid": uid, "name": name},
-                data=json.dumps(kwargs),
-                headers=self.HEADERS,
-            ) as response:
-                payload = await response.json()
-                if payload["status"] == "failed":
-                    logging.error("Failed to track event: %s", payload.get("info"))
-        except Exception as ex:
-            logging.error("Failed to track event.", exc_info=ex)
-
-    def close(self):
-        self.session.close()
-
-
 # NS API.
 # ----------------------------------------------------------------------------------------------------------------------
 
@@ -532,9 +486,8 @@ class Bot:
         ord("э"): "e", ord("ю"): "u", ord("я"): "ya",
     }
 
-    def __init__(self, telegram: Telegram, botan: Botan, ns: Ns):
+    def __init__(self, telegram: Telegram, ns: Ns):
         self.telegram = telegram
-        self.botan = botan
         self.ns = ns
         self.db = None  # type: Database
         self.stations = None  # type: StationIndex
@@ -555,7 +508,6 @@ class Bot:
                 await self.run_loop()
             except Exception as ex:
                 logging.error("Unhandled error.", exc_info=ex)
-                await self.botan.track(None, "Error", message=str(ex))
 
     def stop(self):
         self.is_stopped = True
@@ -662,29 +614,23 @@ class Bot:
         """
         Handles /start command.
         """
-        await asyncio.gather(
-            self.telegram.send_message(
-                sender["id"],
-                Responses.START.format(sender=sender),
-                parse_mode=ParseMode.markdown,
-                reply_markup=(await self.get_default_keyboard(sender["id"])),
-            ),
-            self.botan.track(sender["id"], "Start"),
+        await self.telegram.send_message(
+            sender["id"],
+            Responses.START.format(sender=sender),
+            parse_mode=ParseMode.markdown,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
 
     async def handle_back(self, sender: dict):
         """
         Handles /back command.
         """
-        await asyncio.gather(
-            self.edit_message(
-                sender["id"],
-                None,
-                Responses.DEFAULT.format(sender=sender),
-                parse_mode=ParseMode.markdown,
-                reply_markup=(await self.get_default_keyboard(sender["id"])),
-            ),
-            self.botan.track(sender["id"], "Cancel"),
+        await self.edit_message(
+            sender["id"],
+            None,
+            Responses.DEFAULT.format(sender=sender),
+            parse_mode=ParseMode.markdown,
+            reply_markup=(await self.get_default_keyboard(sender["id"])),
         )
 
     async def handle_add(self, user_id: int, original_message: typing.Optional[dict], station_code: str):
@@ -693,15 +639,12 @@ class Bot:
         """
         await self.db.add_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
-        await asyncio.gather(
-            self.edit_message(
-                user_id,
-                original_message,
-                Responses.ADDED.format(self.get_station_name(station_code)),
-                parse_mode=ParseMode.markdown,
-                reply_markup=reply_markup,
-            ),
-            self.botan.track(user_id, "Add", station_code=station_code),
+        await self.edit_message(
+            user_id,
+            original_message,
+            Responses.ADDED.format(self.get_station_name(station_code)),
+            parse_mode=ParseMode.markdown,
+            reply_markup=reply_markup,
         )
 
     async def handle_delete(self, user_id: int, original_message: typing.Optional[dict], station_code: str):
@@ -710,15 +653,12 @@ class Bot:
         """
         await self.db.delete_favorite_station(user_id, station_code)
         reply_markup = await self.get_default_keyboard(user_id)
-        await asyncio.gather(
-            self.edit_message(
-                user_id,
-                original_message,
-                Responses.DELETED.format(self.get_station_name(station_code)),
-                parse_mode=ParseMode.markdown,
-                reply_markup=reply_markup,
-            ),
-            self.botan.track(user_id, "Delete", station_code=station_code),
+        await self.edit_message(
+            user_id,
+            original_message,
+            Responses.DELETED.format(self.get_station_name(station_code)),
+            parse_mode=ParseMode.markdown,
+            reply_markup=reply_markup,
         )
 
     async def handle_from(self, user_id: int, original_message: typing.Optional[dict], departure_code: str):
@@ -731,15 +671,12 @@ class Bot:
             {"text": "Departures", "callback_data": "/departures %s" % departure_code},
             self.BUTTON_BACK,
         ])
-        await asyncio.gather(
-            self.edit_message(
-                user_id,
-                original_message,
-                Responses.SELECT_DESTINATION.format(station_name=self.get_station_name(departure_code)),
-                parse_mode=ParseMode.markdown,
-                reply_markup=json.dumps({"inline_keyboard": buttons}),
-            ),
-            self.botan.track(user_id, "From", station_code=departure_code),
+        await self.edit_message(
+            user_id,
+            original_message,
+            Responses.SELECT_DESTINATION.format(station_name=self.get_station_name(departure_code)),
+            parse_mode=ParseMode.markdown,
+            reply_markup=json.dumps({"inline_keyboard": buttons}),
         )
 
     async def handle_go(
@@ -795,16 +732,7 @@ class Bot:
                 [self.BUTTON_BACK],
             ],
         })
-        await asyncio.gather(
-            self.edit_message(
-                user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
-            self.botan.track(
-                user_id, "Go",
-                departure_code=departure_code,
-                destination_code=destination_code,
-                route=("%s-%s" % (departure_code, destination_code)),
-            ),
-        )
+        await self.edit_message(user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
 
     async def handle_departures(
         self,
@@ -844,11 +772,7 @@ class Bot:
                 [self.BUTTON_BACK],
             ],
         })
-        await asyncio.gather(
-            self.edit_message(
-                user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup),
-            self.botan.track(user_id, "Departures", station_code=station_code),
-        )
+        await self.edit_message(user_id, original_message, text, parse_mode=ParseMode.markdown, reply_markup=reply_markup)
 
     async def handle_location(self, user_id: int, latitude: float, longitude: float):
         # Find the nearest station.
@@ -871,15 +795,12 @@ class Bot:
                 self.BUTTON_BACK,
             ],
         ])
-        await asyncio.gather(
-            self.telegram.send_location(
-                user_id,
-                station.latitude,
-                station.longitude,
-                disable_notification=True,
-                reply_markup={"inline_keyboard": buttons},
-            ),
-            self.botan.track(user_id, "Location", station_code=departure_code),
+        await self.telegram.send_location(
+            user_id,
+            station.latitude,
+            station.longitude,
+            disable_notification=True,
+            reply_markup={"inline_keyboard": buttons},
         )
 
     async def handle_search_query(self, sender: dict, text: str):
@@ -905,10 +826,7 @@ class Bot:
                 Responses.NO_SEARCH_RESULTS,
                 reply_markup=(await self.get_default_keyboard(sender["id"])),
             )
-        await asyncio.gather(
-            future,
-            self.botan.track(sender["id"], "Query", query=text),
-        )
+        await future
 
     async def get_from_buttons(self, user_id: int, departure_code: str) -> typing.List[typing.List[dict]]:
         """
