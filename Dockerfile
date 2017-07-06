@@ -14,4 +14,4 @@ RUN python3 -m pip install -r requirements.txt
 RUN mkdir -p /srv/ns-bot
 VOLUME /srv/ns-bot
 
-CMD ["python3", "bot.py",  "--verbose", "--log-file /srv/ns-bot/ns-bot.log"]
+CMD ["python3", "bot.py",  "--verbose", "--log-file", "/srv/ns-bot/ns-bot.log"]

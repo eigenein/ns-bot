@@ -2,5 +2,10 @@ version: "3.3"
 services:
   redis:
     image: redis
+    restart: always
   ns-bot:
     image: ns-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - /srv/ns-bot:/srv/ns-bot
