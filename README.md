@@ -13,5 +13,5 @@ cat .env
 # NS_API_PASSWORD='<NS API PASSWORD>'
 
 docker build -t ns-bot .
-docker-compose up
+docker-compose up -d
 ```
