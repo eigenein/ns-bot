@@ -23,7 +23,6 @@ import json
 import logging
 import math
 import pickle
-import sys
 import time
 import typing
 
@@ -34,21 +33,25 @@ import aiohttp
 import aioredis
 import click
 
-try:
-    # noinspection PyUnresolvedReferences
-    import config
-except ImportError:
-    print("Configuration module is not found.", file=sys.stderr)
-    sys.exit(1)
-
 
 # CLI Commands.
 # ----------------------------------------------------------------------------------------------------------------------
 
 @click.command()
+@click.option("--telegram-token", help="Telegram Bot API token.", required=True, envvar="NS_BOT_TELEGRAM_TOKEN")
+@click.option("--botan-token", help="Botan.io API token.", required=True, envvar="NS_BOT_BOTAN_TOKEN")
+@click.option("--ns-login", help="NS API login.", required=True, envvar="NS_API_LOGIN")
+@click.option("--ns-password", help="NS API password.", required=True, envvar="NS_API_PASSWORD")
 @click.option("-l", "--log-file", type=click.File("at", encoding="utf-8"))
 @click.option("-v", "--verbose", type=bool, is_flag=True)
-def main(log_file: click.File, verbose: bool):
+def main(
+    telegram_token: str,
+    botan_token: str,
+    ns_login: str,
+    ns_password: str,
+    log_file: click.File,
+    verbose: bool,
+):
     logging.basicConfig(
         datefmt="%Y-%m-%d %H:%M:%S",
         format="%(asctime)s [%(levelname).1s] %(message)s",
@@ -58,9 +61,9 @@ def main(log_file: click.File, verbose: bool):
 
     logging.info("Starting bot…")
     with ExitStack() as exit_stack:
-        telegram = exit_stack.enter_context(closing(Telegram(config.TELEGRAM_TOKEN)))
-        botan = exit_stack.enter_context(closing(Botan(config.BOTAN_TOKEN)))
-        ns = exit_stack.enter_context(closing(Ns(config.NS_LOGIN, config.NS_PASSWORD)))
+        telegram = exit_stack.enter_context(closing(Telegram(telegram_token)))
+        botan = exit_stack.enter_context(closing(Botan(botan_token)))
+        ns = exit_stack.enter_context(closing(Ns(ns_login, ns_password)))
         bot = exit_stack.enter_context(closing(Bot(telegram, botan, ns)))
         try:
             asyncio.ensure_future(bot.run())
@@ -127,7 +130,7 @@ class Database:
 
     @staticmethod
     async def create():
-        return Database(await aioredis.create_redis(("localhost", 6379)))
+        return Database(await aioredis.create_redis(("redis", 6379)))
 
     def __init__(self, connection: aioredis.Redis):
         self.connection = connection

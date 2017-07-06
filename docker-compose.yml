@@ -1,0 +1,6 @@
+version: "1"
+services:
+  redis:
+    image: redis
+  ns-bot:
+    image: ns-bot
