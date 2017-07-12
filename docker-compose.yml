@@ -9,3 +9,5 @@ services:
     env_file: .env
     volumes:
       - /srv/ns-bot:/srv/ns-bot
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
