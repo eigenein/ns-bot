@@ -4,7 +4,7 @@ MAINTAINER Pavel Perestoronin <eigenein@gmail.com>
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
-RUN apt update && apt -y install python3-pip
+RUN apt update && apt -y install tzdata python3-pip
 
 COPY . /opt/ns-bot
 WORKDIR /opt/ns-bot
